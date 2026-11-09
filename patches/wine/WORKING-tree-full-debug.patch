@@ -81,7 +81,7 @@ index aaaa4d7..81ceab4 100644
          wow_teb->DeallocationStack = PtrToUlong( stack.DeallocationStack );
          return STATUS_SUCCESS;
 diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
-index cffadf9..9120dd1 100644
+index cffadf9..604edae 100644
 --- a/dlls/ntdll/unix/virtual.c
 +++ b/dlls/ntdll/unix/virtual.c
 @@ -261,13 +261,22 @@ static inline BOOL use_aslr(void)
@@ -380,7 +380,7 @@ index cffadf9..9120dd1 100644
  #ifdef __APPLE__
      /* Rosetta on Apple Silicon misreports certain write faults as read faults. */
      if (err == EXCEPTION_READ_FAULT && (get_unix_prot( vprot ) & PROT_READ))
-@@ -4519,6 +4740,59 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+@@ -4519,6 +4740,72 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
      }
  #endif
  
@@ -432,15 +432,28 @@ index cffadf9..9120dd1 100644
 +    {
 +        unsigned int *i386 = get_cpu_area( data, IMAGE_FILE_MACHINE_I386 );
 +        if (i386)
-+            ERR( "null-page %s fault addr %p: i386 Eip %08x Esp %08x Ebp %08x\\n",
++        {
++            unsigned int eip = i386[0xB8/4];
++            char code[64]; int off = 0, i;
++            static const char hex[] = "0123456789abcdef";
++            const unsigned char *p = (const unsigned char *)(ULONG_PTR)(eip - 16);
++            for (i = 0; i < 28; i++)
++            {
++                code[off++] = hex[p[i] >> 4];
++                code[off++] = hex[p[i] & 15];
++            }
++            code[off] = 0;
++            ERR( "null-page %s fault addr %p: i386 Eip %08x Esp %08x Ebp %08x Edi %08x Esi %08x Ebx %08x Edx %08x Ecx %08x Eax %08x code[-16..+12] %s\\n",
 +                 err == EXCEPTION_WRITE_FAULT ? "write" : "read", addr,
-+                 i386[0xB8/4], i386[0xC4/4], i386[0xB4/4] );
++                 eip, i386[0xC4/4], i386[0xB4/4], i386[0x9C/4], i386[0xA0/4],
++                 i386[0xA4/4], i386[0xA8/4], i386[0xAC/4], i386[0xB0/4], code );
++        }
 +    }
 +
      if (!is_inside_signal_stack( data, stack ) && (vprot & VPROT_GUARD))
      {
          struct thread_stack_info stack_info;
-@@ -4528,10 +4802,32 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+@@ -4528,10 +4815,32 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
              mprotect_range( page, host_page_size, 0, 0 );
              ret = STATUS_GUARD_PAGE_VIOLATION;
          }
@@ -474,7 +487,7 @@ index cffadf9..9120dd1 100644
          if (vprot & VPROT_WRITEWATCH)
          {
              if (enable_write_exceptions && is_vprot_exec_write( vprot ) && !data->allow_writes)
-@@ -4546,16 +4842,113 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+@@ -4546,16 +4855,113 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
                  mprotect_range( page, host_page_size, 0, 0 );
              }
          }
@@ -591,7 +604,7 @@ index cffadf9..9120dd1 100644
          else
  #endif
          /* ignore fault if page is writable now */
-@@ -4567,16 +4960,62 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+@@ -4567,16 +4973,62 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
      }
  #if defined(__APPLE__) && defined(__aarch64__)
      else if (err == EXCEPTION_EXECUTE_FAULT && is_vprot_exec_write( vprot ) &&
@@ -660,7 +673,7 @@ index cffadf9..9120dd1 100644
      rec->ExceptionCode = ret;
      return ret;
  }
-@@ -4682,11 +5121,21 @@ void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t
+@@ -4682,11 +5134,21 @@ void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t
  
      if (stack < stack_info.start + host_page_size)
      {
@@ -687,7 +700,7 @@ index cffadf9..9120dd1 100644
      }
      else if (stack < stack_info.limit)
      {
-@@ -6979,7 +7428,12 @@ NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T
+@@ -6979,7 +7441,12 @@ NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T
              {
                  BYTE vprot = get_host_page_vprot( page );
                  if (is_vprot_exec_write( vprot ) && (get_unix_prot( vprot ) & PROT_EXEC))

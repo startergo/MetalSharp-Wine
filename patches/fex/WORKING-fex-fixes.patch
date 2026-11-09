@@ -68,6 +68,26 @@ index 1a0001c..5e587dc 100644
  
    FEX::FetchHostFeatures(Features, HostFeatures, !IsWine, CTR, MIDR);
  
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index e5e0cd8..853796e 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -56,7 +56,14 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
+ 
+     const bool HasExec = ProtHasExec(Prot);
+     const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Prot));
+-    const bool EffectiveRWX = EffectiveExec && ProtIsWritable(Prot);
++    /* Write-trap only explicitly executable pages. With DEP disabled every readable
++     * protect is "effective exec": a packer's per-byte unprotect would insert the
++     * page as an SMC interval, the recompiled stub re-traps it read-only, and the
++     * retried store faults again - an unbreakable loop (observed 3874 iterations).
++     * DEP-promoted pages stay execute-tracked and are still invalidated on every
++     * protection change, so self-modifying code that goes through VirtualProtect
++     * keeps working; only the write-trap is limited to real exec protections. */
++    const bool EffectiveRWX = HasExec && ProtIsWritable(Prot);
+ 
+     if (EffectiveExec) {
+       XIntervals.Insert(ProtInterval);
 diff --git a/Source/Windows/Common/WinAPI/Alloc.cpp b/Source/Windows/Common/WinAPI/Alloc.cpp
 index ded646b..96f696d 100644
 --- a/Source/Windows/Common/WinAPI/Alloc.cpp
@@ -85,7 +105,7 @@ index ded646b..96f696d 100644
      return nullptr;
    }
 diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
-index a45a87b..fcd0e95 100644
+index a45a87b..5de1be7 100644
 --- a/Source/Windows/WOW64/Module.cpp
 +++ b/Source/Windows/WOW64/Module.cpp
 @@ -134,6 +134,15 @@ namespace BridgeInstrs {
@@ -222,16 +242,29 @@ index a45a87b..fcd0e95 100644
        if (InvalidationTracker->HandleRWXAccessViolation(Thread, Context->Pc, FaultAddress)) {
          if (CTX->IsAddressInCodeBuffer(Thread, Context->Pc) && !CTX->IsCurrentBlockSingleInst(Thread) &&
              CTX->IsAddressInCurrentBlock(Thread, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {
-@@ -798,7 +862,7 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+@@ -798,7 +862,20 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
      return true;
    }
  
 -  FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSIGBUSCount, 1);
 +  if (Thread) FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSIGBUSCount, 1);
++  if (Exception->ExceptionCode == EXCEPTION_DATATYPE_MISALIGNMENT) {
++    { static volatile unsigned M; if ((++M & 0x3F) == 1) {
++        const uint64_t Rip = Thread ? Thread->CurrentFrame->State.rip : 0;
++        char B[400]; int Off;
++        const unsigned char* P = reinterpret_cast<const unsigned char*>(Rip - 32);
++        static const char Hex[] = "0123456789abcdef";
++        Off = snprintf(B, sizeof(B), "FEXMISALIGN gripeip %llx ppc %llx code[-32..+95] ",
++                       (unsigned long long)Rip, (unsigned long long)Context->Pc);
++        for (int i = 0; i < 128 && Off > 0 && (size_t)Off < sizeof(B) - 3; i++) {
++          B[Off++] = Hex[P[i] >> 4]; B[Off++] = Hex[P[i] & 15];
++        }
++        if (Off > 0 && (size_t)Off < sizeof(B)) { B[Off++] = '\n'; B[Off] = 0; WLOG2(B); } } }
++  }
    if (Exception->ExceptionCode == EXCEPTION_DATATYPE_MISALIGNMENT && Context::HandleUnalignedAccess(Context)) {
      LogMan::Msg::DFmt("Handled unaligned atomic: new pc: {:X}", Context->Pc);
      return true;
-@@ -807,6 +871,14 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+@@ -807,6 +884,14 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
    LogMan::Msg::DFmt("Reconstructing context");
  
    WOW64_CONTEXT* WowContext = Context::ReconstructWowContext(Context);
@@ -246,15 +279,16 @@ index a45a87b..fcd0e95 100644
    LogMan::Msg::DFmt("pc: {:X} eip: {:X} code: {:X}", Context->Pc, WowContext->Eip, Exception->ExceptionCode);
  
    auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
-@@ -824,7 +896,12 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+@@ -824,7 +909,13 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
    // wow64.dll will handle adjusting PC in the dispatched context after a breakpoint
  
    Context::UnlockJITContext();
 -  NtRaiseException(&GuestException, GetTLS().EntryContext(), FirstChance);
-+  { static volatile unsigned N; if ((++N & 0x3FF) == 1) {
-+      char B[160];
-+      snprintf(B, sizeof(B), "FEXRAISE eip %08x esp %08x ppc %llx\n",
-+               WowContext->Eip, WowContext->Esp, (unsigned long long)Context->Pc);
++  { static volatile unsigned N; if ((++N & 0xF) == 1) {
++      char B[200];
++      snprintf(B, sizeof(B), "FEXRAISE eip %08x esp %08x ppc %llx gripeip %llx\n",
++               WowContext->Eip, WowContext->Esp, (unsigned long long)Context->Pc,
++               (unsigned long long)(Thread ? Thread->CurrentFrame->State.rip : 0));
 +      WLOG2(B); } }
 +  NtRaiseException(&GuestException, EntryCtx, FirstChance);
    return false;
