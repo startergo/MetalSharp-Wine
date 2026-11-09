@@ -1,0 +1,72 @@
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index cffadf9..4ae30c8 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -261,13 +261,17 @@ static inline BOOL use_aslr(void)
+            (main_image_info.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE);
+ }
+ 
++/* Anonymous writable+executable memory is mapped MAP_JIT: Apple Silicon
++ * grants W+X only there (see mprotect_exec). */
++#define ANON_MMAP_JIT(prot) (((prot) & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC) ? MAP_JIT : 0)
++
+ /* mmap() anonymous memory at a fixed address */
+ void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
+ {
+     assert( !((UINT_PTR)start & host_page_mask) );
+     assert( !(size & host_page_mask) );
+ 
+-    return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, -1, 0 );
++    return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags | ANON_MMAP_JIT(prot), -1, 0 );
+ }
+ 
+ /* allocate anonymous mmap() memory at any address */
+@@ -275,7 +279,7 @@ void *anon_mmap_alloc( size_t size, int prot )
+ {
+     assert( !(size & host_page_mask) );
+ 
+-    return mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON, -1, 0 );
++    return mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON | ANON_MMAP_JIT(prot), -1, 0 );
+ }
+ 
+ static inline UINT_PTR make_mem_area( void *base, enum area_state state )
+@@ -1719,9 +1723,36 @@ static NTSTATUS get_vprot_flags( DWORD protect, unsigned int *vprot, BOOL image
+ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
+ {
+ #if defined(__APPLE__) && defined(__aarch64__)
+-    /* W+X is never granted without MAP_JIT; start executable, virtual_handle_fault() flips
+-     * the host page between RX and RW as needed. */
+-    if ((unix_prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC)) unix_prot &= ~PROT_WRITE;
++    /* W+X is granted where the platform allows it: directly when the mapping
++     * already permits it, or after remapping anonymous memory MAP_JIT (Apple
++     * Silicon grants W+X only to MAP_JIT mappings; an emulator's allocator -
++     * rpmalloc pools VirtualProtect'ed to executable, for one - asks for it on
++     * plain anonymous pages, which otherwise pay a write fault and an execute
++     * fault per W^X flip in virtual_handle_fault(), hundreds of thousands per
++     * second while it generates code). */
++    if ((unix_prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC))
++    {
++        if (!mprotect( base, size, unix_prot )) return 0;
++#ifdef MAP_JIT
++        {
++            struct file_view *view = find_view( base, size );
++            if (view && is_wow64() && !(view->protect & (VPROT_SYSTEM | VPROT_ARM64EC)))
++            {
++                void *tmp = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0 );
++                if (tmp != MAP_FAILED)
++                {
++                    memcpy( tmp, base, size );
++                    if (mmap( base, size, PROT_READ | PROT_WRITE,
++                              MAP_PRIVATE | MAP_ANON | MAP_FIXED | MAP_JIT, -1, 0 ) == base)
++                        memcpy( base, tmp, size );
++                    munmap( tmp, size );
++                    if (!mprotect( base, size, unix_prot )) return 0;
++                }
++            }
++        }
++#endif
++        unix_prot &= ~PROT_WRITE;
++    }
+ #endif
+     if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
+     {

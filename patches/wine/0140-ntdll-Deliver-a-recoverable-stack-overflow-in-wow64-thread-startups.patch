@@ -1,0 +1,31 @@
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index cffadf9..e938acb 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -4682,11 +4682,21 @@ void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t
+ 
+     if (stack < stack_info.start + host_page_size)
+     {
+-        /* stack overflow on last page, unrecoverable */
+-        UINT diff = stack_info.start + host_page_size - stack;
+-        ERR( "stack overflow %u bytes addr %p stack %p (%p-%p-%p)\n",
+-             diff, rec->ExceptionAddress, stack, stack_info.start, stack_info.limit, stack_info.end );
+-        abort_thread(1);
++        if (stack < stack_info.start)
++        {
++            /* below the whole stack: unrecoverable */
++            UINT diff = stack_info.start - stack;
++            ERR( "stack overflow %u bytes addr %p stack %p (%p-%p-%p)\n",
++                 diff, rec->ExceptionAddress, stack, stack_info.start, stack_info.limit, stack_info.end );
++            abort_thread(1);
++        }
++        /* The frame still fits in the stack's first mapped page. Windows
++         * delivers a stack-overflow exception here, which the application's
++         * SEH can unwind and recover from; WoW64's translated code faults
++         * with its stack pointer that low (the emulator's frames share the
++         * guest stack), so aborting kills programs that Windows runs. */
++        rec->ExceptionCode = STATUS_STACK_OVERFLOW;
++        rec->NumberParameters = 0;
+     }
+     else if (stack < stack_info.limit)
+     {

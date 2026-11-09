@@ -1,0 +1,232 @@
+diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+index 799e0d6..3e8bd8c 100644
+--- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+@@ -955,8 +955,13 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
+   return AllocatedInfo;
+ }
+ 
++/* Set by the frontend (BTCpuProcessInit) to receive every compiled guest block. */
++extern "C" void (*FEXGuestBlockCallback)(uint64_t);
++void (*FEXGuestBlockCallback)(uint64_t);
++
+ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size, bool SingleInst, const FEXCore::IR::IRListView* IR,
+                                                    FEXCore::Core::DebugData* DebugData, bool CheckTF) {
++  if (FEXGuestBlockCallback) FEXGuestBlockCallback(Entry);
+   FEXCORE_PROFILE_SCOPED("Arm64::CompileCode");
+ 
+   const auto PrevNumAllocations = Relocations.size();
+@@ -998,6 +1003,11 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+   // JIT output is first written to a temporary buffer and later relocated to the CodeBuffer.
+   // This minimizes lock contention of CodeBufferWriteMutex.
+   auto TempCodeBufferInfo = TempCodeBufferAllocator.ReownOrClaimBufferWithSize(DesiredBufferRange);
++  if (!TempCodeBufferInfo.Ptr) {
++    /* A null temp buffer reaches the emitter and kills the process with a
++     * write to address 0. Fail loudly instead. */
++    std::terminate();
++  }
+   auto TempCodeBuffer = TempCodeBufferInfo.Ptr;
+   const uint32_t UsableBufferRange = TempCodeBufferInfo.Size - FEXCore::Utils::FEX_PAGE_SIZE;
+ 
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+index eee5023..655b563 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+@@ -19,7 +19,11 @@ static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
+ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
+   : AllocatedSize(Size) {
+   Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
+-  LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
++  if (!Ptr) {
++    /* LOGMAN_THROW compiles out in release; a null buffer reaches the JIT
++     * emitter and kills the process with a write to address 0. Die loudly. */
++    std::terminate();
++  }
+ 
+   // Protect the last page of the allocated buffer to trigger SIGSEGV on write access
+   uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
+diff --git a/Source/Windows/Common/CPUFeatures.cpp b/Source/Windows/Common/CPUFeatures.cpp
+index 1a0001c..5e587dc 100644
+--- a/Source/Windows/Common/CPUFeatures.cpp
++++ b/Source/Windows/Common/CPUFeatures.cpp
+@@ -69,11 +69,17 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
+ 
+   FEXCore::HostFeatures HostFeatures = {};
+ 
+-  for (uint32_t Idx = 0; Key; Key = OpenProcessorKey(++Idx)) {
++  /* The sweep's only exit on Windows is a failed key open beyond the last
++   * CPU; a registry that answers every index (wine's can) never ends it.
++   * Bound it by the processor count the OS reports. */
++  SYSTEM_INFO SysInfo;
++  GetSystemInfo(&SysInfo);
++  for (uint32_t Idx = 0; Key && Idx < SysInfo.dwNumberOfProcessors; Key = OpenProcessorKey(++Idx)) {
+     // Truncate to 32-bits, top 32-bits are all reserved in MIDR
+     HostFeatures.CPUMIDRs.push_back(static_cast<uint32_t>(ReadRegU64(Key, "CP 4000")));
+     RegCloseKey(Key);
+   }
++  RegCloseKey(Key);
+ 
+   FEX::FetchHostFeatures(Features, HostFeatures, !IsWine, CTR, MIDR);
+ 
+diff --git a/Source/Windows/Common/WinAPI/Alloc.cpp b/Source/Windows/Common/WinAPI/Alloc.cpp
+index ded646b..96f696d 100644
+--- a/Source/Windows/Common/WinAPI/Alloc.cpp
++++ b/Source/Windows/Common/WinAPI/Alloc.cpp
+@@ -49,6 +49,11 @@ DLLEXPORT_FUNC(void*, VirtualAlloc, (void* lpAddress, SIZE_T dwSize, DWORD flAll
+   }
+ #endif
+   if (Status) {
++    /* Wine's allocation failure status: the JIT's temp-buffer null crashes
++     * far away; log it at the source. */
++    if (Status & 0xC0000000) {
++      DbgPrint("FEXVA: NtAllocateVirtualMemory size=%lu failed status %lx\n", (unsigned long)dwSize, Status);
++    }
+     SetLastError(RtlNtStatusToDosError(Status));
+     return nullptr;
+   }
+diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
+index a45a87b..ff99aa3 100644
+--- a/Source/Windows/WOW64/Module.cpp
++++ b/Source/Windows/WOW64/Module.cpp
+@@ -134,6 +134,15 @@ namespace BridgeInstrs {
+ } // namespace BridgeInstrs
+ 
+ fextl::unique_ptr<FEXCore::Context::Context> CTX;
++// Direct wine debug output: CRT file IO deadlocks in exception context.
++static void (*WineDbgOut2)(const char*);
++static void WLOG2(const char* Msg) {
++  if (!WineDbgOut2) {
++    WineDbgOut2 = reinterpret_cast<decltype(WineDbgOut2)>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_dbg_output"));
++  }
++  if (WineDbgOut2) WineDbgOut2(Msg);
++}
++
+ fextl::unique_ptr<FEX::DummyHandlers::DummySignalDelegator> SignalDelegator;
+ fextl::unique_ptr<WowSyscallHandler> SyscallHandler;
+ fextl::unique_ptr<FEX::Windows::StatAlloc> StatAllocHandler;
+@@ -444,6 +453,15 @@ public:
+ 
+       Context::FlushThreadStateContext();
+       Context::UnlockJITContext();
++      { /* Guest-RIP sampler: which guest code makes the unix calls. */
++        static volatile unsigned Samples;
++        if ((++Samples & 0x3FF) == 0) {
++          char B[128];
++          snprintf(B, sizeof(B), "FEXUCALL rip %llx id %x\n",
++                   (unsigned long long)ReturnRIP, (unsigned)StackArgs->ID);
++          WLOG2(B);
++        }
++      }
+       ReturnRAX = static_cast<uint64_t>(WineUnixCall(StackArgs->Handle, StackArgs->ID, ULongToPtr(StackArgs->Args)));
+       Context::LockJITContext();
+       Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
+@@ -500,7 +518,29 @@ public:
+   }
+ };
+ 
++/* Guest-RIP block-compile sampler: FEXCore calls this for every JIT-compiled
++ * guest block (weak hook). A stable loop stops producing new blocks; the ring
++ * buffer's tail at that point is the loop body's guest addresses. */
++static void GuestBlockLogger(uint64_t GuestEntry) {
++  static uint64_t Ring[64];
++  static unsigned RingIdx, Total;
++  Ring[RingIdx++ & 63] = GuestEntry;
++  if (true) {
++    char B[1024];
++    int Off = snprintf(B, sizeof(B), "FEXBLOCKS n=%u tail:", Total);
++    for (unsigned i = 0; i < 16 && Off > 0 && (size_t)Off < sizeof(B) - 12; i++)
++      Off += snprintf(B + Off, sizeof(B) - Off, " %llx",
++                      (unsigned long long)Ring[(RingIdx - 16 + i) & 63]);
++    snprintf(B + Off, sizeof(B) - Off, "\n");
++    WLOG2(B);
++  }
++}
++
++extern "C" void (*FEXGuestBlockCallback)(uint64_t);
++
+ void BTCpuProcessInit() {
++  FEXGuestBlockCallback = &GuestBlockLogger;
++  WLOG2("FEXCB-SET\n");
+   FEX::Windows::InitCRTProcess();
+   FEX::Windows::SetupThreadHandlers();
+   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
+@@ -559,7 +599,11 @@ void BTCpuProcessInit() {
+ 
+   CPUFeatures.emplace(*CTX);
+ 
+-  // Allocate the syscall/unixcall trampolines in the lower 2GB of the address space
++  // Allocate the syscall/unixcall trampolines in the lower 2GB of the address space.
++  // W+X is grantable only to MAP_JIT mappings on Apple Silicon: allocating a
++  // page-sized region and remapping it MAP_JIT from birth lets the write and
++  // the execution both succeed; a plain RWX request only maps RX and the
++  // trampoline store then faults unhandled (killing the process).
+   SIZE_T Size = 4;
+   void* Addr = nullptr;
+   NtAllocateVirtualMemory(NtCurrentProcess(), &Addr, (1U << 31) - 1, &Size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+@@ -731,6 +775,16 @@ __attribute__((naked)) void BTCpuSimulate() {
+ }
+ 
+ extern "C" void BTCpuSimulateImpl(CONTEXT* entry_context) {
++  { /* Guest-RIP sampler: BTCpuSimulate runs once per dispatch iteration. */
++    static volatile unsigned Samples;
++    if ((++Samples & 0x7) == 0) {  // every 65536th
++      auto T = GetTLS().ThreadState();
++      char B[96];
++      snprintf(B, sizeof(B), "FEXSIM rip %llx\n",
++               T && T->CurrentFrame ? (unsigned long long)T->CurrentFrame->State.rip : 0ull);
++      WLOG2(B);
++    }
++  }
+   const auto TLS = GetTLS();
+   TLS.EntryContext() = entry_context;
+   TLS.CachedCallRetSp() = TLS.ThreadState()->CurrentFrame->State.callret_sp;
+@@ -749,12 +803,21 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+   auto* Context = Ptrs->ContextRecord;
+   auto* Exception = Ptrs->ExceptionRecord;
+   auto Thread = GetTLS().ThreadState();
+-  FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedSignalTime);
++  /* The TLS slot can hold a stale pointer (the thread left simulation) and every
++   * use of it below derefs it: a fault while handling a fault unwinds into the
++   * nested-exception loop. Validate once; treat bad as absent. No profiling on
++   * this path: FEXCORE_PROFILE_* deref ThreadState->ThreadStats. */
++  {
++    MEMORY_BASIC_INFORMATION Mbi;
++    if (Thread && (NtQueryVirtualMemory(NtCurrentProcess(), Thread, MemoryBasicInformation, &Mbi, sizeof(Mbi), NULL) ||
++                   Mbi.State == MEM_FREE))
++      Thread = nullptr;
++  }
+ 
+   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+     const auto FaultAddress = static_cast<uint64_t>(Exception->ExceptionInformation[1]);
+ 
+-    if (FEX::Windows::CallRetStack::HandleAccessViolation(Thread, FaultAddress, Context->X25)) {
++    if (Thread && FEX::Windows::CallRetStack::HandleAccessViolation(Thread, FaultAddress, Context->X25)) {
+       return true;
+     }
+ 
+@@ -762,14 +825,14 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+       return true;
+     }
+ 
+-    if (FEX::Windows::JITGuardPage::HandleJITGuardPage(Thread, reinterpret_cast<void*>(FaultAddress), Context->X,
++    if (Thread && FEX::Windows::JITGuardPage::HandleJITGuardPage(Thread, reinterpret_cast<void*>(FaultAddress), Context->X,
+                                                        reinterpret_cast<__uint128_t*>(Context->V), &Context->Pc)) {
+       return true;
+     }
+ 
+     if (Thread) {
+       std::scoped_lock Lock(ThreadCreationMutex);
+-      FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
++      if (Thread) FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
+       if (InvalidationTracker->HandleRWXAccessViolation(Thread, Context->Pc, FaultAddress)) {
+         if (CTX->IsAddressInCodeBuffer(Thread, Context->Pc) && !CTX->IsCurrentBlockSingleInst(Thread) &&
+             CTX->IsAddressInCurrentBlock(Thread, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {
+@@ -798,7 +861,7 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+     return true;
+   }
+ 
+-  FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSIGBUSCount, 1);
++  if (Thread) FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSIGBUSCount, 1);
+   if (Exception->ExceptionCode == EXCEPTION_DATATYPE_MISALIGNMENT && Context::HandleUnalignedAccess(Context)) {
+     LogMan::Msg::DFmt("Handled unaligned atomic: new pc: {:X}", Context->Pc);
+     return true;
