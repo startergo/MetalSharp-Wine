@@ -998,6 +998,11 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   // JIT output is first written to a temporary buffer and later relocated to the CodeBuffer.
   // This minimizes lock contention of CodeBufferWriteMutex.
   auto TempCodeBufferInfo = TempCodeBufferAllocator.ReownOrClaimBufferWithSize(DesiredBufferRange);
+  if (!TempCodeBufferInfo.Ptr) {
+    /* A null temp buffer reaches the emitter and kills the process with a
+     * write to address 0. Fail loudly instead. */
+    std::terminate();
+  }
   auto TempCodeBuffer = TempCodeBufferInfo.Ptr;
   const uint32_t UsableBufferRange = TempCodeBufferInfo.Size - FEXCore::Utils::FEX_PAGE_SIZE;
 

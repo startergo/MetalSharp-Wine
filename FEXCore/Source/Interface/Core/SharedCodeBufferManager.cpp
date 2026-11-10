@@ -19,7 +19,11 @@ static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
 CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
   : AllocatedSize(Size) {
   Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
-  LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
+  if (!Ptr) {
+    /* LOGMAN_THROW compiles out in release; a null buffer reaches the JIT
+     * emitter and kills the process with a write to address 0. Die loudly. */
+    std::terminate();
+  }
 
   // Protect the last page of the allocated buffer to trigger SIGSEGV on write access
   uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);

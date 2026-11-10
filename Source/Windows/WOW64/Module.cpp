@@ -134,6 +134,15 @@ namespace BridgeInstrs {
 } // namespace BridgeInstrs
 
 fextl::unique_ptr<FEXCore::Context::Context> CTX;
+// Direct wine debug output: CRT file IO deadlocks in exception context.
+static void (*WineDbgOut2)(const char*);
+static void WLOG2(const char* Msg) {
+  if (!WineDbgOut2) {
+    WineDbgOut2 = reinterpret_cast<decltype(WineDbgOut2)>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "__wine_dbg_output"));
+  }
+  if (WineDbgOut2) WineDbgOut2(Msg);
+}
+
 fextl::unique_ptr<FEX::DummyHandlers::DummySignalDelegator> SignalDelegator;
 fextl::unique_ptr<WowSyscallHandler> SyscallHandler;
 fextl::unique_ptr<FEX::Windows::StatAlloc> StatAllocHandler;
@@ -559,7 +568,11 @@ void BTCpuProcessInit() {
 
   CPUFeatures.emplace(*CTX);
 
-  // Allocate the syscall/unixcall trampolines in the lower 2GB of the address space
+  // Allocate the syscall/unixcall trampolines in the lower 2GB of the address space.
+  // W+X is grantable only to MAP_JIT mappings on Apple Silicon: allocating a
+  // page-sized region and remapping it MAP_JIT from birth lets the write and
+  // the execution both succeed; a plain RWX request only maps RX and the
+  // trampoline store then faults unhandled (killing the process).
   SIZE_T Size = 4;
   void* Addr = nullptr;
   NtAllocateVirtualMemory(NtCurrentProcess(), &Addr, (1U << 31) - 1, &Size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
@@ -749,12 +762,21 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
   auto* Context = Ptrs->ContextRecord;
   auto* Exception = Ptrs->ExceptionRecord;
   auto Thread = GetTLS().ThreadState();
-  FEXCORE_PROFILE_ACCUMULATION(Thread, AccumulatedSignalTime);
+  /* The TLS slot can hold a stale pointer (the thread left simulation) and every
+   * use of it below derefs it: a fault while handling a fault unwinds into the
+   * nested-exception loop. Validate once; treat bad as absent. No profiling on
+   * this path: FEXCORE_PROFILE_* deref ThreadState->ThreadStats. */
+  {
+    MEMORY_BASIC_INFORMATION Mbi;
+    if (Thread && (NtQueryVirtualMemory(NtCurrentProcess(), Thread, MemoryBasicInformation, &Mbi, sizeof(Mbi), NULL) ||
+                   Mbi.State == MEM_FREE))
+      Thread = nullptr;
+  }
 
   if (Exception->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
     const auto FaultAddress = static_cast<uint64_t>(Exception->ExceptionInformation[1]);
 
-    if (FEX::Windows::CallRetStack::HandleAccessViolation(Thread, FaultAddress, Context->X25)) {
+    if (Thread && FEX::Windows::CallRetStack::HandleAccessViolation(Thread, FaultAddress, Context->X25)) {
       return true;
     }
 
@@ -762,14 +784,14 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
       return true;
     }
 
-    if (FEX::Windows::JITGuardPage::HandleJITGuardPage(Thread, reinterpret_cast<void*>(FaultAddress), Context->X,
+    if (Thread && FEX::Windows::JITGuardPage::HandleJITGuardPage(Thread, reinterpret_cast<void*>(FaultAddress), Context->X,
                                                        reinterpret_cast<__uint128_t*>(Context->V), &Context->Pc)) {
       return true;
     }
 
     if (Thread) {
       std::scoped_lock Lock(ThreadCreationMutex);
-      FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
+      if (Thread) FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSMCCount, 1);
       if (InvalidationTracker->HandleRWXAccessViolation(Thread, Context->Pc, FaultAddress)) {
         if (CTX->IsAddressInCodeBuffer(Thread, Context->Pc) && !CTX->IsCurrentBlockSingleInst(Thread) &&
             CTX->IsAddressInCurrentBlock(Thread, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {
@@ -798,7 +820,7 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
     return true;
   }
 
-  FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSIGBUSCount, 1);
+  if (Thread) FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSIGBUSCount, 1);
   if (Exception->ExceptionCode == EXCEPTION_DATATYPE_MISALIGNMENT && Context::HandleUnalignedAccess(Context)) {
     LogMan::Msg::DFmt("Handled unaligned atomic: new pc: {:X}", Context->Pc);
     return true;
@@ -807,6 +829,14 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
   LogMan::Msg::DFmt("Reconstructing context");
 
   WOW64_CONTEXT* WowContext = Context::ReconstructWowContext(Context);
+  auto* EntryCtx = GetTLS().EntryContext();
+  if (!WowContext || !EntryCtx) {
+    /* A stale TLS hands ReconstructWowContext a garbage destination: the
+     * state store below then writes through a wild pointer and the guest
+     * context is lost. Bail out instead of corrupting both worlds. */
+    WLOG2("FEXRC-BADCTX\n");
+    return false;
+  }
   LogMan::Msg::DFmt("pc: {:X} eip: {:X} code: {:X}", Context->Pc, WowContext->Eip, Exception->ExceptionCode);
 
   auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
@@ -824,7 +854,7 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
   // wow64.dll will handle adjusting PC in the dispatched context after a breakpoint
 
   Context::UnlockJITContext();
-  NtRaiseException(&GuestException, GetTLS().EntryContext(), FirstChance);
+  NtRaiseException(&GuestException, EntryCtx, FirstChance);
   return false;
 }
 

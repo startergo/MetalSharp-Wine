@@ -56,7 +56,14 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
 
     const bool HasExec = ProtHasExec(Prot);
     const bool EffectiveExec = HasExec || (DEPDisabled && ProtIsReadable(Prot));
-    const bool EffectiveRWX = EffectiveExec && ProtIsWritable(Prot);
+    /* Write-trap only explicitly executable pages. With DEP disabled every readable
+     * protect is "effective exec": a packer's per-byte unprotect would insert the
+     * page as an SMC interval, the recompiled stub re-traps it read-only, and the
+     * retried store faults again - an unbreakable loop (observed 3874 iterations).
+     * DEP-promoted pages stay execute-tracked and are still invalidated on every
+     * protection change, so self-modifying code that goes through VirtualProtect
+     * keeps working; only the write-trap is limited to real exec protections. */
+    const bool EffectiveRWX = HasExec && ProtIsWritable(Prot);
 
     if (EffectiveExec) {
       XIntervals.Insert(ProtInterval);

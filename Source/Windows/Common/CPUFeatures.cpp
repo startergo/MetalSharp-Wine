@@ -69,11 +69,17 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
 
   FEXCore::HostFeatures HostFeatures = {};
 
-  for (uint32_t Idx = 0; Key; Key = OpenProcessorKey(++Idx)) {
+  /* The sweep's only exit on Windows is a failed key open beyond the last
+   * CPU; a registry that answers every index (wine's can) never ends it.
+   * Bound it by the processor count the OS reports. */
+  SYSTEM_INFO SysInfo;
+  GetSystemInfo(&SysInfo);
+  for (uint32_t Idx = 0; Key && Idx < SysInfo.dwNumberOfProcessors; Key = OpenProcessorKey(++Idx)) {
     // Truncate to 32-bits, top 32-bits are all reserved in MIDR
     HostFeatures.CPUMIDRs.push_back(static_cast<uint32_t>(ReadRegU64(Key, "CP 4000")));
     RegCloseKey(Key);
   }
+  RegCloseKey(Key);
 
   FEX::FetchHostFeatures(Features, HostFeatures, !IsWine, CTR, MIDR);
 
