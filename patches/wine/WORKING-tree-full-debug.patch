@@ -81,7 +81,7 @@ index aaaa4d7..81ceab4 100644
          wow_teb->DeallocationStack = PtrToUlong( stack.DeallocationStack );
          return STATUS_SUCCESS;
 diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
-index cffadf9..e503017 100644
+index cffadf9..616f550 100644
 --- a/dlls/ntdll/unix/virtual.c
 +++ b/dlls/ntdll/unix/virtual.c
 @@ -261,13 +261,22 @@ static inline BOOL use_aslr(void)
@@ -387,7 +387,7 @@ index cffadf9..e503017 100644
  #ifdef __APPLE__
      /* Rosetta on Apple Silicon misreports certain write faults as read faults. */
      if (err == EXCEPTION_READ_FAULT && (get_unix_prot( vprot ) & PROT_READ))
-@@ -4519,6 +4739,72 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+@@ -4519,6 +4739,90 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
      }
  #endif
  
@@ -457,10 +457,28 @@ index cffadf9..e503017 100644
 +        }
 +    }
 +
++    /* The emulator's arena: reserved-but-writable pages the emulator
++     * touches during module loading, expecting commit-on-demand (its
++     * OvercommitTracker only covers ranges it was told about). A read of
++     * such a page is an unhandled fault that kills the loader (fixtures
++     * die with no output, c00000bb-class). Commit the page on demand. */
++    if (err == EXCEPTION_READ_FAULT && (ULONG_PTR)addr >= 0x0000700000000000UL &&
++        (ULONG_PTR)addr < 0x0000800000000000UL &&
++        (vprot & VPROT_READ) && (vprot & VPROT_WRITE) && !(vprot & VPROT_COMMITTED))
++    {
++        set_page_vprot_bits( page, host_page_size, VPROT_COMMITTED, 0 );
++        mprotect_range( page, host_page_size, 0, 0 );
++        { static volatile int OLogged; if (OLogged++ < 8)
++            ERR( "overcommit: %p committed on demand (vprot %02x)\n", page, vprot ); }
++        mutex_unlock( &virtual_mutex );
++        rec->ExceptionCode = STATUS_SUCCESS;
++        return STATUS_SUCCESS;
++    }
++
      if (!is_inside_signal_stack( data, stack ) && (vprot & VPROT_GUARD))
      {
          struct thread_stack_info stack_info;
-@@ -4528,10 +4814,32 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+@@ -4528,10 +4832,32 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
              mprotect_range( page, host_page_size, 0, 0 );
              ret = STATUS_GUARD_PAGE_VIOLATION;
          }
@@ -494,7 +512,7 @@ index cffadf9..e503017 100644
          if (vprot & VPROT_WRITEWATCH)
          {
              if (enable_write_exceptions && is_vprot_exec_write( vprot ) && !data->allow_writes)
-@@ -4546,16 +4854,113 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+@@ -4546,16 +4872,113 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
                  mprotect_range( page, host_page_size, 0, 0 );
              }
          }
@@ -611,7 +629,7 @@ index cffadf9..e503017 100644
          else
  #endif
          /* ignore fault if page is writable now */
-@@ -4567,16 +4972,62 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+@@ -4567,16 +4990,62 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
      }
  #if defined(__APPLE__) && defined(__aarch64__)
      else if (err == EXCEPTION_EXECUTE_FAULT && is_vprot_exec_write( vprot ) &&
@@ -680,7 +698,7 @@ index cffadf9..e503017 100644
      rec->ExceptionCode = ret;
      return ret;
  }
-@@ -4682,11 +5133,21 @@ void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t
+@@ -4682,11 +5151,21 @@ void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t
  
      if (stack < stack_info.start + host_page_size)
      {
@@ -707,7 +725,7 @@ index cffadf9..e503017 100644
      }
      else if (stack < stack_info.limit)
      {
-@@ -6979,7 +7440,12 @@ NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T
+@@ -6979,7 +7458,12 @@ NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T
              {
                  BYTE vprot = get_host_page_vprot( page );
                  if (is_vprot_exec_write( vprot ) && (get_unix_prot( vprot ) & PROT_EXEC))
