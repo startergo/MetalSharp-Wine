@@ -1854,7 +1854,11 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
          * pages high in the address space, and remapping those plain
          * breaks its code generation (kernel32 c0000135 under load). */
         if (unmap_jit_pages( base, size, unix_prot ))
+        {
+            { static volatile int ULogged; if (ULogged++ < 8)
+                ERR( "jitunmap %p: remapped plain prot %x\n", base, unix_prot ); }
             return 0;
+        }
     }
     if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
     {
@@ -4695,6 +4699,34 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
     vprot = get_host_page_vprot( page );
 
 #ifdef __APPLE__
+    if ((ULONG_PTR)addr >= 0x26e000UL && (ULONG_PTR)addr < 0x270000UL)
+    { static volatile int GLogged; if (GLogged++ < 40)
+        ERR( "w26: %s fault addr %p page %p vprot %02x sigstack %d\n",
+             err == EXCEPTION_WRITE_FAULT ? "write" : err == EXCEPTION_READ_FAULT ? "read" : "exec",
+             addr, page, vprot, is_inside_signal_stack( data, stack ) ); }
+#endif
+
+#ifdef __APPLE__
+    /* Faults in the top 64K of the 32-bit space: the WoW64 TEB/stack pages. */
+    if ((ULONG_PTR)addr >= 0xffff0000UL && (ULONG_PTR)addr < 0x100000000UL)
+    {
+        static volatile int top_logged;
+        if (top_logged < 32)
+        {
+            struct thread_stack_info stack_info;
+            int in_stack = is_inside_thread_stack( data, page, &stack_info );
+            top_logged++;
+            { WOW_TEB *wt = get_wow_teb( data->teb );
+              ERR( "top4G %s fault addr %p vprot %02x unix_prot %x sigstack %d in_thread_stack %d [%p-%p] sp %p wow_stack_base %lx wow_stack_limit %lx\n",
+                 err == EXCEPTION_WRITE_FAULT ? "write" : err == EXCEPTION_READ_FAULT ? "read" : "exec",
+                 addr, vprot, get_unix_prot( vprot ), is_inside_signal_stack( data, stack ),
+                 in_stack, in_stack ? stack_info.start : NULL, in_stack ? stack_info.end : NULL, stack,
+                 wt ? (unsigned long)wt->Tib.StackBase : 0ul, wt ? (unsigned long)wt->Tib.StackLimit : 0ul ); }
+        }
+    }
+#endif
+
+#ifdef __APPLE__
     /* Rosetta on Apple Silicon misreports certain write faults as read faults. */
     if (err == EXCEPTION_READ_FAULT && (get_unix_prot( vprot ) & PROT_READ))
     {
@@ -4736,10 +4768,36 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
                 ERR( "wow64: program stack moved to the top of the 4G space (was %lx-%lx)\n",
                      (unsigned long)wow_teb->Tib.StackLimit, (unsigned long)wow_teb->Tib.StackBase );
             }
+            else if (esp < 0xffff0000UL)
+            { static volatile int TLogged; if (TLogged++ < 8)
+                ERR( "top4G: write to %p with Esp %08x mapped as data, stack NOT rebased\n", addr, esp ); }
             TRACE( "wow64 top-of-4G stack page %p mapped on demand\n", page );
             mutex_unlock( &virtual_mutex );
             rec->ExceptionCode = STATUS_SUCCESS;
             return STATUS_SUCCESS;
+        }
+    }
+
+    /* Null-page faults: log the guest context (which app instruction). */
+    if ((ULONG_PTR)addr < 0x10000UL && is_wow64())
+    {
+        unsigned int *i386 = get_cpu_area( data, IMAGE_FILE_MACHINE_I386 );
+        if (i386)
+        {
+            unsigned int eip = i386[0xB8/4];
+            char code[64]; int off = 0, i;
+            static const char hex[] = "0123456789abcdef";
+            const unsigned char *p = (const unsigned char *)(ULONG_PTR)(eip - 16);
+            for (i = 0; i < 28; i++)
+            {
+                code[off++] = hex[p[i] >> 4];
+                code[off++] = hex[p[i] & 15];
+            }
+            code[off] = 0;
+            ERR( "null-page %s fault addr %p: i386 Eip %08x Esp %08x Ebp %08x Edi %08x Esi %08x Ebx %08x Edx %08x Ecx %08x Eax %08x code[-16..+12] %s\\n",
+                 err == EXCEPTION_WRITE_FAULT ? "write" : "read", addr,
+                 eip, i386[0xC4/4], i386[0xB4/4], i386[0x9C/4], i386[0xA0/4],
+                 i386[0xA4/4], i386[0xA8/4], i386[0xAC/4], i386[0xB0/4], code );
         }
     }
 
@@ -4754,6 +4812,8 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
     {
         set_page_vprot_bits( page, host_page_size, VPROT_COMMITTED, 0 );
         mprotect_range( page, host_page_size, 0, 0 );
+        { static volatile int OLogged; if (OLogged++ < 8)
+            ERR( "overcommit: %p committed on demand (vprot %02x)\n", page, vprot ); }
         mutex_unlock( &virtual_mutex );
         rec->ExceptionCode = STATUS_SUCCESS;
         return STATUS_SUCCESS;
@@ -4768,7 +4828,16 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
             mprotect_range( page, host_page_size, 0, 0 );
             ret = STATUS_GUARD_PAGE_VIOLATION;
         }
-        else ret = grow_thread_stack( data, page, &stack_info );
+        else
+        {
+            ret = grow_thread_stack( data, page, &stack_info );
+#ifdef __APPLE__
+            if ((ULONG_PTR)addr >= 0x26e000UL && (ULONG_PTR)addr < 0x270000UL)
+            { static volatile int GGLogged; if (GGLogged++ < 20)
+                ERR( "w26grow: page %p grew, vprot now %02x ret %lx\n",
+                     page, get_host_page_vprot( page ), (unsigned long)ret ); }
+#endif
+        }
     }
     else if (err == EXCEPTION_WRITE_FAULT)
     {
@@ -4779,7 +4848,11 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
          * for this thread; an emulator's code generation hits this on every
          * first write per thread. */
         if (is_vprot_exec_write( vprot ) && (get_unix_prot( vprot ) & PROT_WRITE))
+        {
             pthread_jit_write_protect_np( false );
+            { static volatile int WLogged; if (WLogged++ < 8)
+                ERR( "jitwr: page %p vprot %02x: write-protect toggled, retrying\n", page, vprot ); }
+        }
 #endif
         if (vprot & VPROT_WRITEWATCH)
         {
@@ -4795,6 +4868,14 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
                 mprotect_range( page, host_page_size, 0, 0 );
             }
         }
+#if defined(__APPLE__) && defined(__aarch64__)
+        if ((ULONG_PTR)addr < 0x10000000UL)
+        { static volatile int PLogged; if (PLogged++ < 24) {
+            struct thread_stack_info psi;
+            ERR( "wprobe: addr %p page %p vprot %02x pvprot %02x instack %d wow %d\n",
+                 addr, page, vprot, get_page_vprot( ROUND_ADDR( addr, page_mask ) ),
+                 is_inside_thread_stack( data, page, &psi ), is_wow64() ); } }
+#endif
 #if defined(__APPLE__) && defined(__aarch64__)
         /* W^X: a W+X page is mapped RX (see mprotect_exec), make it RW for the write */
         if (is_vprot_exec_write( get_host_page_vprot( page ) ) &&
@@ -4831,7 +4912,11 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
                             register_remapped_jit_page( page, host_page_size );
                             pthread_jit_write_protect_np( false );
                             ret = STATUS_SUCCESS;
+                            { static volatile int RLogged; if (RLogged++ < 8)
+                                ERR( "jitfix: %p remapped MAP_JIT RWX\n", page ); }
                         }
+                        else { static volatile int FLogged; if (FLogged++ < 8)
+                            ERR( "jitfix: MAP_JIT remap failed errno %d page %p\n", errno, page ); }
                         munmap( tmp, host_page_size );
                     }
                 }
@@ -4873,6 +4958,9 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
                     }
                 }
             }
+            if (ret == STATUS_SUCCESS)
+            { static volatile int SLogged; if (SLogged++ < 8)
+                ERR( "stackstub: ro stack page %p made writable for %p (vprot %02x kept)\n", page, addr, vprot ); }
         }
         /* chain continues for MAP_JIT-presumed / flip-refused cases */
         else if (is_vprot_exec_write( get_host_page_vprot( page ) ) && !is_host_page_write_mixed( page ))
@@ -4900,11 +4988,18 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
     else if (err == EXCEPTION_EXECUTE_FAULT && is_vprot_exec_write( vprot ) &&
              (get_unix_prot( vprot ) & PROT_EXEC))
     {
+        {   static volatile int XLogged;
+            if (XLogged < 8) { XLogged++;
+                int xe = errno;
+                ERR( "jitx: page %p vprot %02x exec-fault\n", page, vprot ); xe = 0; }
+        }
         /* W^X: page was RW, make it RX again. A non-MAP_JIT page takes the
          * mprotect; a MAP_JIT page cannot be mprotect'ed at all on macOS -
          * its W<->X state is the per-thread JIT write toggle (APRR). */
         if (!mprotect( page, host_page_size, PROT_READ | PROT_EXEC ))
         {
+            { static volatile int X1Logged; if (X1Logged++ < 8)
+                ERR( "jitx: %p flipped RX\n", page ); }
             sys_icache_invalidate( page, host_page_size );
             ret = STATUS_SUCCESS;
         }
@@ -4915,6 +5010,8 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
              * with writes enabled execution is masked. Write-protect this
              * thread: execution returns, and the next store faults into the
              * write branch above, which toggles writes back on. */
+            { static volatile int X2Logged; if (X2Logged++ < 8)
+                ERR( "jitx: %p mprotect RX refused errno %d - re-protecting\n", page, errno ); }
             pthread_jit_write_protect_np( true );
             sys_icache_invalidate( page, host_page_size );
             ret = STATUS_SUCCESS;
@@ -4922,6 +5019,29 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
     }
 #endif
     mutex_unlock( &virtual_mutex );
+#ifdef __APPLE__
+    if (ret == STATUS_ACCESS_VIOLATION)
+    {
+        /* First few unhandled faults, with the state the branches saw. */
+        static volatile void *logged_addr[16];
+        static volatile int logged;
+        int seen = 0, li;
+        for (li = 0; li < 16 && li < logged; li++) if (logged_addr[li] == addr) { seen = 1; break; }
+        if (!seen && logged < 1000000)
+        {
+            if (logged < 16) logged_addr[logged] = addr;
+
+            struct thread_stack_info stack_info;
+            int in_stack = is_inside_thread_stack( data, page, &stack_info );
+            logged++;
+            ERR( "unhandled %s fault addr %p page %p vprot %02x unix_prot %x%s [%p-%p] sp %p\n",
+                 err == EXCEPTION_WRITE_FAULT ? "write" : err == EXCEPTION_READ_FAULT ? "read" : "exec",
+                 addr, page, vprot, get_unix_prot( vprot ),
+                 in_stack ? " INSIDE thread stack" : "",
+                 in_stack ? stack_info.start : NULL, in_stack ? stack_info.end : NULL, stack );
+        }
+    }
+#endif
     rec->ExceptionCode = ret;
     return ret;
 }

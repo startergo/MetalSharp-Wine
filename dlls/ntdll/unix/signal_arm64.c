@@ -1482,6 +1482,10 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     EXCEPTION_RECORD rec = { .ExceptionAddress = (void *)PC_sig(sigcontext) };
     DWORD64 esr = get_fault_esr( sigcontext );
 
+    if ((ULONG_PTR)siginfo->si_addr < 0x10000)
+        ERR( "null fault: addr %p native pc %p lr %p\n", siginfo->si_addr,
+             (void *)PC_sig(sigcontext), (void *)LR_sig(sigcontext) );
+
     switch (ESR_ELx_EC(esr))
     {
     case ESR_ELx_EC_IABT_LOW:
@@ -1998,6 +2002,8 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
         i386_context->Eax = (ULONG_PTR)entry;
         i386_context->Ebx = (arg == peb ? (ULONG_PTR)wow_peb : (ULONG_PTR)arg);
         i386_context->Esp = get_wow_teb( teb )->Tib.StackBase - 16;
+        ERR( "init_syscall_frame: i386 Esp := %lx (wow StackBase %lx, teb %p, i386_context %p)\n",
+             i386_context->Esp, get_wow_teb( teb )->Tib.StackBase, teb, i386_context );
         i386_context->Eip = pLdrSystemDllInitBlock->pRtlUserThreadStart;
         i386_context->SegCs = 0x23;
         i386_context->SegDs = 0x2b;

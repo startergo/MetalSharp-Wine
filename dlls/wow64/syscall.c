@@ -1536,6 +1536,7 @@ void WINAPI Wow64PrepareForException( EXCEPTION_RECORD *rec, CONTEXT *context )
 {
     EXCEPTION_POINTERS ptrs = { rec, context };
 
+    ERR( "wowprep: rec code %lx pc %llx\n", rec->ExceptionCode, (unsigned long long)context->Pc );
     pBTCpuResetToConsistentState( &ptrs );
 }
 #endif

@@ -1198,8 +1198,11 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
 
         /* 32-bit stack */
         if (!limit || limit > user_space_wow_limit) limit = user_space_wow_limit;
-        if ((status = virtual_alloc_thread_stack( &stack, 0, limit, reserve_size, commit_size, TRUE )))
-            return status;
+        status = virtual_alloc_thread_stack( &stack, 0, limit, reserve_size, commit_size, TRUE );
+        ERR( "wow 32-bit stack: status %x limit %lx reserve %lx commit %lx -> base %p limit %p dealloc %p\n",
+             status, (unsigned long)limit, (unsigned long)reserve_size, (unsigned long)commit_size,
+             stack.StackBase, stack.StackLimit, stack.DeallocationStack );
+        if (status) return status;
         wow_teb->Tib.StackBase = PtrToUlong( stack.StackBase );
         {
             /* The syscall bootstrap (init_syscall_frame, on the thread's first

@@ -3833,6 +3833,11 @@ static NTSTATUS query_dword_option( HANDLE hkey, LPCWSTR name, LONG *value )
     RtlInitUnicodeString( &str, name );
 
     size = sizeof(buffer) - sizeof(WCHAR);
+    {   /* which value a wow64 guest polls */
+        static volatile int Logged;
+        if (Logged < 8) { Logged++;
+            ERR( "regpoll: %s\n", debugstr_w(name) ); }
+    }
     if ((status = NtQueryValueKey( hkey, &str, KeyValuePartialInformation, buffer, size, &size )))
         return status;
 
@@ -4517,6 +4522,8 @@ static void init_wow64( CONTEXT *context )
         GET_PTR( Wow64LdrpInitialize );
         GET_PTR( Wow64PrepareForException );
 #undef GET_PTR
+        ERR( "init_wow64: prepare %p ldr %p (wow64 base %p)\n", pWow64PrepareForException,
+             pWow64LdrpInitialize, wow64 );
         imports_fixup_done = TRUE;
     }
 
