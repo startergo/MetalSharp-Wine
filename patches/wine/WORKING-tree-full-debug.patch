@@ -81,7 +81,7 @@ index aaaa4d7..81ceab4 100644
          wow_teb->DeallocationStack = PtrToUlong( stack.DeallocationStack );
          return STATUS_SUCCESS;
 diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
-index cffadf9..0ce5a51 100644
+index cffadf9..e503017 100644
 --- a/dlls/ntdll/unix/virtual.c
 +++ b/dlls/ntdll/unix/virtual.c
 @@ -261,13 +261,22 @@ static inline BOOL use_aslr(void)
@@ -117,7 +117,7 @@ index cffadf9..0ce5a51 100644
  }
  
  static inline UINT_PTR make_mem_area( void *base, enum area_state state )
-@@ -940,6 +949,109 @@ static inline BOOL is_host_page_write_mixed( const void *addr ) { return FALSE;
+@@ -940,6 +949,90 @@ static inline BOOL is_host_page_write_mixed( const void *addr ) { return FALSE;
  #endif
  
  
@@ -177,26 +177,6 @@ index cffadf9..0ce5a51 100644
 + * mprotect_range deadlocks on virtual_mutex (observed: NtAllocateVirtualMemory
 + * wedged in set_protection when a freed JIT page was re-allocated while its
 + * address stayed in the registry). */
-+static BOOL range_pages_committed( void *base, size_t size )
-+{
-+    /* vprot is set before the mapping exists during allocation, so probe
-+     * the kernel's view: mincore() reports ENOMEM for unmapped pages
-+     * without faulting. A remap copy on unmapped pages faults into
-+     * virtual_handle_fault while virtual_mutex is held - self-deadlock
-+     * (winedevice wedged in NtAllocateVirtualMemory). */
-+    unsigned char vec[256];
-+    char *p = ROUND_ADDR( base, host_page_mask );
-+    char *end = (char *)base + size;
-+    while (p < end)
-+    {
-+        size_t n = end - p;
-+        if (n > sizeof(vec) * host_page_size) n = sizeof(vec) * host_page_size;
-+        if (mincore( p, n, vec )) return FALSE;
-+        p += n;
-+    }
-+    return TRUE;
-+}
-+
 +static BOOL unmap_jit_pages( void *base, size_t size, int unix_prot )
 +{
 +    char *start = ROUND_ADDR( base, host_page_mask );
@@ -204,11 +184,12 @@ index cffadf9..0ce5a51 100644
 +    BOOL ok = TRUE;
 +    char *page;
 +
-+    if (!range_pages_committed( start, end - start )) return FALSE;
 +    for (page = start; page < end; page += host_page_size)
 +    {
-+        void *tmp = mmap( NULL, host_page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0 );
++        void *tmp;
 +        int i, n = remapped_jit_page_count;
++        if (!is_remapped_jit_page( page )) continue; /* registered = mapped */
++        tmp = mmap( NULL, host_page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0 );
 +        if (tmp == MAP_FAILED) { ok = FALSE; continue; }
 +        memcpy( tmp, page, host_page_size );
 +        if (mmap( page, host_page_size, unix_prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0 ) != page)
@@ -227,7 +208,7 @@ index cffadf9..0ce5a51 100644
  /***********************************************************************
   *           get_vprot_range_size
   *
-@@ -1584,6 +1696,12 @@ static void delete_view( struct file_view *view ) /* [in] View */
+@@ -1584,6 +1677,12 @@ static void delete_view( struct file_view *view ) /* [in] View */
  {
      if (!(view->protect & VPROT_SYSTEM)) unmap_area( view->base, view->size );
      set_page_vprot( view->base, view->size, 0 );
@@ -240,7 +221,7 @@ index cffadf9..0ce5a51 100644
      if (view->protect & VPROT_ARM64EC) clear_arm64ec_range( view->base, view->size );
      unregister_view( view );
      free_view( view );
-@@ -1716,12 +1834,83 @@ static NTSTATUS get_vprot_flags( DWORD protect, unsigned int *vprot, BOOL image
+@@ -1716,13 +1815,55 @@ static NTSTATUS get_vprot_flags( DWORD protect, unsigned int *vprot, BOOL image
   *
   * Wrapper for mprotect, adds PROT_EXEC if forced by force_exec_prot
   */
@@ -267,45 +248,17 @@ index cffadf9..0ce5a51 100644
 +            return 0;
 +        }
 +        if (!mprotect( base, size, unix_prot )) return 0;
-+#ifdef MAP_JIT
-+        /* Apple Silicon grants W+X only to MAP_JIT mappings; an emulator's
-+         * allocator (rpmalloc pools VirtualProtect'ed to executable, for one)
-+         * asks for it on plain anonymous pages, which then pay a write fault
-+         * and an execute fault per W^X flip instead - hundreds of thousands
-+         * per second while it generates code. Remap the range MAP_JIT,
-+         * contents preserved, and the protections are grantable. */
-+        {
-+            struct file_view *view = find_view( base, size );
-+            if (view && !(view->protect & VPROT_ARM64EC) && range_pages_committed( base, size ))
-+            {
-+                void *tmp = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0 );
-+                if (tmp != MAP_FAILED)
-+                {
-+                    memcpy( tmp, base, size );
-+                    if (mmap( base, size, PROT_READ | PROT_WRITE | PROT_EXEC,
-+                              MAP_PRIVATE | MAP_ANON | MAP_FIXED | MAP_JIT, -1, 0 ) == base)
-+                    {
-+                        memcpy( base, tmp, size );
-+                        register_remapped_jit_page( base, size );
-+                        TRACE( "remapped %p-%p MAP_JIT for W+X\n", base, (char *)base + size - 1 );
-+                    }
-+                    munmap( tmp, size );
-+                    pthread_jit_write_protect_np( false );
-+                    /* The mapping is now MAP_JIT RWX: mprotect on it is refused
-+                     * wholesale on macOS, but the protections the caller asked
-+                     * for are in force for this thread (toggle off), so report
-+                     * success - the toggle, not mprotect, governs the page. */
-+                    if (is_remapped_jit_page( ROUND_ADDR( base, host_page_mask ) ))
-+                    {
-+                        { static volatile int RLogged; if (RLogged++ < 8)
-+                            ERR( "jitremap %p: MAP_JIT remapped, W+X via toggle\n", base ); }
-+                        return 0;
-+                    }
-+                    ERR( "jitremap %p: mprotect(%x) refused errno %d\n", base, unix_prot, errno );
-+                }
-+            }
-+        }
-+#endif
++        /* ENOMEM: not mapped at unix level yet (an allocation in progress -
++         * its protection is applied by this very call). Nothing to preserve,
++         * remapping would copy from unmapped pages. EPERM: mapped, W+X
++         * refused - the remap case. */
++        /* ENOMEM (not yet mapped) or EPERM (W+X refused): strip write and
++         * let the plain mprotect below apply what it can; the first store
++         * to such a page faults once and the fault handler remaps it MAP_JIT
++         * - never speculatively copy here, a partially-mapped range
++         * deadlocks (mprotect reports EPERM before it reaches the
++         * unmapped tail pages). */
+ #endif
 +        unix_prot &= ~PROT_WRITE;
 +    }
 +    else if ((ULONG_PTR)base < 0x0000700000000000UL &&
@@ -324,10 +277,10 @@ index cffadf9..0ce5a51 100644
 +            return 0;
 +        }
 +    }
- #endif
      if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
      {
-@@ -2031,6 +2220,16 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
+         TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );
+@@ -2031,6 +2172,16 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
          unix_prot = get_unix_prot( vprot & ~VPROT_WRITEWATCH );
  
      unix_prot &= ~PROT_EXEC;
@@ -344,7 +297,7 @@ index cffadf9..0ce5a51 100644
  
      if (base)
      {
-@@ -2064,6 +2263,26 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
+@@ -2064,6 +2215,26 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
          }
          else
          {
@@ -371,7 +324,7 @@ index cffadf9..0ce5a51 100644
              if ((ptr = anon_mmap_alloc( view_size, unix_prot )) == MAP_FAILED)
              {
                  status = (errno == ENOMEM) ? STATUS_NO_MEMORY : STATUS_INVALID_PARAMETER;
-@@ -4496,6 +4715,27 @@ static NTSTATUS grow_thread_stack( struct thread_data *data, char *page, struct
+@@ -4496,6 +4667,27 @@ static NTSTATUS grow_thread_stack( struct thread_data *data, char *page, struct
  }
  
  
@@ -399,7 +352,7 @@ index cffadf9..0ce5a51 100644
  /***********************************************************************
   *           virtual_handle_fault
   */
-@@ -4510,6 +4750,34 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+@@ -4510,6 +4702,34 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
      mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
      vprot = get_host_page_vprot( page );
  
@@ -434,7 +387,7 @@ index cffadf9..0ce5a51 100644
  #ifdef __APPLE__
      /* Rosetta on Apple Silicon misreports certain write faults as read faults. */
      if (err == EXCEPTION_READ_FAULT && (get_unix_prot( vprot ) & PROT_READ))
-@@ -4519,6 +4787,72 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+@@ -4519,6 +4739,72 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
      }
  #endif
  
@@ -507,7 +460,7 @@ index cffadf9..0ce5a51 100644
      if (!is_inside_signal_stack( data, stack ) && (vprot & VPROT_GUARD))
      {
          struct thread_stack_info stack_info;
-@@ -4528,10 +4862,32 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+@@ -4528,10 +4814,32 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
              mprotect_range( page, host_page_size, 0, 0 );
              ret = STATUS_GUARD_PAGE_VIOLATION;
          }
@@ -541,7 +494,7 @@ index cffadf9..0ce5a51 100644
          if (vprot & VPROT_WRITEWATCH)
          {
              if (enable_write_exceptions && is_vprot_exec_write( vprot ) && !data->allow_writes)
-@@ -4546,16 +4902,113 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+@@ -4546,16 +4854,113 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
                  mprotect_range( page, host_page_size, 0, 0 );
              }
          }
@@ -610,7 +563,8 @@ index cffadf9..0ce5a51 100644
 +         * needed (the emulator fetches guest code as data) - and leave
 +         * vprot alone so VirtualQuery keeps reporting what the app set. */
 +        else if (is_wow64() && is_ro_stack_page( data, addr, page ))
-+        {
+         {
+-            TRACE_(wx)( "%p: RX -> RW for write to %p\n", page, addr );
 +            if (!mprotect( page, host_page_size, PROT_READ | PROT_WRITE ))
 +                ret = STATUS_SUCCESS;
 +            else if (is_remapped_jit_page( page ))
@@ -643,8 +597,7 @@ index cffadf9..0ce5a51 100644
 +        }
 +        /* chain continues for MAP_JIT-presumed / flip-refused cases */
 +        else if (is_vprot_exec_write( get_host_page_vprot( page ) ) && !is_host_page_write_mixed( page ))
-         {
--            TRACE_(wx)( "%p: RX -> RW for write to %p\n", page, addr );
++        {
 +            TRACE_(wx)( "%p: MAP_JIT presumed, write enabled by toggle for %p\n", page, addr );
              ret = STATUS_SUCCESS;
          }
@@ -658,7 +611,7 @@ index cffadf9..0ce5a51 100644
          else
  #endif
          /* ignore fault if page is writable now */
-@@ -4567,16 +5020,62 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+@@ -4567,16 +4972,62 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
      }
  #if defined(__APPLE__) && defined(__aarch64__)
      else if (err == EXCEPTION_EXECUTE_FAULT && is_vprot_exec_write( vprot ) &&
@@ -727,7 +680,7 @@ index cffadf9..0ce5a51 100644
      rec->ExceptionCode = ret;
      return ret;
  }
-@@ -4682,11 +5181,21 @@ void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t
+@@ -4682,11 +5133,21 @@ void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t
  
      if (stack < stack_info.start + host_page_size)
      {
@@ -754,7 +707,7 @@ index cffadf9..0ce5a51 100644
      }
      else if (stack < stack_info.limit)
      {
-@@ -6979,7 +7488,12 @@ NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T
+@@ -6979,7 +7440,12 @@ NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T
              {
                  BYTE vprot = get_host_page_vprot( page );
                  if (is_vprot_exec_write( vprot ) && (get_unix_prot( vprot ) & PROT_EXEC))
