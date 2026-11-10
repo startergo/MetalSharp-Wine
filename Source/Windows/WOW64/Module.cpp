@@ -453,6 +453,15 @@ public:
 
       Context::FlushThreadStateContext();
       Context::UnlockJITContext();
+      { /* Guest-RIP sampler: which guest code makes the unix calls. */
+        static volatile unsigned Samples;
+        if ((++Samples & 0x3FF) == 0) {
+          char B[128];
+          snprintf(B, sizeof(B), "FEXUCALL rip %llx id %x\n",
+                   (unsigned long long)ReturnRIP, (unsigned)StackArgs->ID);
+          WLOG2(B);
+        }
+      }
       ReturnRAX = static_cast<uint64_t>(WineUnixCall(StackArgs->Handle, StackArgs->ID, ULongToPtr(StackArgs->Args)));
       Context::LockJITContext();
       Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
@@ -509,7 +518,30 @@ public:
   }
 };
 
+/* Guest-RIP block-compile sampler: FEXCore calls this for every JIT-compiled
+ * guest block (weak hook). A stable loop stops producing new blocks; the ring
+ * buffer's tail at that point is the loop body's guest addresses. */
+static void GuestBlockLogger(uint64_t GuestEntry) {
+  static uint64_t Ring[64];
+  static unsigned RingIdx, Total;
+  Ring[RingIdx++ & 63] = GuestEntry;
+  if ((++Total & 16383) == 1) {  /* first block, then every 16384th: the tail at
+                                    that point still names a stable loop body */
+    char B[1024];
+    int Off = snprintf(B, sizeof(B), "FEXBLOCKS n=%u tail:", Total);
+    for (unsigned i = 0; i < 16 && Off > 0 && (size_t)Off < sizeof(B) - 12; i++)
+      Off += snprintf(B + Off, sizeof(B) - Off, " %llx",
+                      (unsigned long long)Ring[(RingIdx - 16 + i) & 63]);
+    snprintf(B + Off, sizeof(B) - Off, "\n");
+    WLOG2(B);
+  }
+}
+
+extern "C" void (*FEXGuestBlockCallback)(uint64_t);
+
 void BTCpuProcessInit() {
+  FEXGuestBlockCallback = &GuestBlockLogger;
+  { char B[96]; snprintf(B, sizeof(B), "FEXBASE %p\n", (void*)&BTCpuProcessInit); WLOG2(B); }
   FEX::Windows::InitCRTProcess();
   FEX::Windows::SetupThreadHandlers();
   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
@@ -744,6 +776,16 @@ __attribute__((naked)) void BTCpuSimulate() {
 }
 
 extern "C" void BTCpuSimulateImpl(CONTEXT* entry_context) {
+  { /* Guest-RIP sampler: BTCpuSimulate runs once per dispatch iteration. */
+    static volatile unsigned Samples;
+    if ((++Samples & 0x7) == 0) {  // every 65536th
+      auto T = GetTLS().ThreadState();
+      char B[96];
+      snprintf(B, sizeof(B), "FEXSIM rip %llx\n",
+               T && T->CurrentFrame ? (unsigned long long)T->CurrentFrame->State.rip : 0ull);
+      WLOG2(B);
+    }
+  }
   const auto TLS = GetTLS();
   TLS.EntryContext() = entry_context;
   TLS.CachedCallRetSp() = TLS.ThreadState()->CurrentFrame->State.callret_sp;
@@ -821,6 +863,14 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
   }
 
   if (Thread) FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSIGBUSCount, 1);
+  if (Exception->ExceptionCode == EXCEPTION_DATATYPE_MISALIGNMENT) {
+    { static volatile unsigned M; if ((++M & 0x3F) == 1) {
+        const uint64_t Rip = Thread ? Thread->CurrentFrame->State.rip : 0;
+        char B[96];
+        snprintf(B, sizeof(B), "FEXMISALIGN gripeip %llx ppc %llx\n",
+                 (unsigned long long)Rip, (unsigned long long)Context->Pc);
+        WLOG2(B); } }
+  }
   if (Exception->ExceptionCode == EXCEPTION_DATATYPE_MISALIGNMENT && Context::HandleUnalignedAccess(Context)) {
     LogMan::Msg::DFmt("Handled unaligned atomic: new pc: {:X}", Context->Pc);
     return true;
@@ -854,6 +904,12 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
   // wow64.dll will handle adjusting PC in the dispatched context after a breakpoint
 
   Context::UnlockJITContext();
+  { static volatile unsigned N; if ((++N & 0xF) == 1) {
+      char B[200];
+      snprintf(B, sizeof(B), "FEXRAISE eip %08x esp %08x ppc %llx gripeip %llx\n",
+               WowContext->Eip, WowContext->Esp, (unsigned long long)Context->Pc,
+               (unsigned long long)(Thread ? Thread->CurrentFrame->State.rip : 0));
+      WLOG2(B); } }
   NtRaiseException(&GuestException, EntryCtx, FirstChance);
   return false;
 }

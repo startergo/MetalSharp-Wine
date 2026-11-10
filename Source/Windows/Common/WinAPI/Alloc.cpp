@@ -49,6 +49,11 @@ DLLEXPORT_FUNC(void*, VirtualAlloc, (void* lpAddress, SIZE_T dwSize, DWORD flAll
   }
 #endif
   if (Status) {
+    /* Wine's allocation failure status: the JIT's temp-buffer null crashes
+     * far away; log it at the source. */
+    if (Status & 0xC0000000) {
+      DbgPrint("FEXVA: NtAllocateVirtualMemory size=%lu failed status %lx\n", (unsigned long)dwSize, Status);
+    }
     SetLastError(RtlNtStatusToDosError(Status));
     return nullptr;
   }

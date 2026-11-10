@@ -955,8 +955,13 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
   return AllocatedInfo;
 }
 
+/* Set by the frontend (BTCpuProcessInit) to receive every compiled guest block. */
+extern "C" void (*FEXGuestBlockCallback)(uint64_t);
+void (*FEXGuestBlockCallback)(uint64_t);
+
 CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size, bool SingleInst, const FEXCore::IR::IRListView* IR,
                                                    FEXCore::Core::DebugData* DebugData, bool CheckTF) {
+  if (FEXGuestBlockCallback) FEXGuestBlockCallback(Entry);
   FEXCORE_PROFILE_SCOPED("Arm64::CompileCode");
 
   const auto PrevNumAllocations = Relocations.size();
