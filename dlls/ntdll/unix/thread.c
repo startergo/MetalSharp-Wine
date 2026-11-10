@@ -1201,6 +1201,21 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
         if ((status = virtual_alloc_thread_stack( &stack, 0, limit, reserve_size, commit_size, TRUE )))
             return status;
         wow_teb->Tib.StackBase = PtrToUlong( stack.StackBase );
+        {
+            /* The syscall bootstrap (init_syscall_frame, on the thread's first
+             * kernel request) may have snapshotted the WoW stack into the
+             * initial i386 Esp before this allocated it: the ~0 placeholder
+             * leaves Esp in the unmapped top of the 4G space and the thread
+             * runs on exception-recovered writes to it. Repair the snapshot. */
+            struct thread_data *self = get_thread_data();
+            I386_CONTEXT *i386 = (self && self->teb == teb) ? get_cpu_area( self, IMAGE_FILE_MACHINE_I386 ) : NULL;
+            if (i386 && i386->Esp >= 0xffff0000UL)
+            {
+                ERR( "wow Esp repaired: %lx -> %lx\n",
+                     (unsigned long)i386->Esp, (unsigned long)PtrToUlong( stack.StackBase ) - 16 );
+                i386->Esp = PtrToUlong( stack.StackBase ) - 16;
+            }
+        }
         wow_teb->Tib.StackLimit = PtrToUlong( stack.StackLimit );
         wow_teb->DeallocationStack = PtrToUlong( stack.DeallocationStack );
         return STATUS_SUCCESS;

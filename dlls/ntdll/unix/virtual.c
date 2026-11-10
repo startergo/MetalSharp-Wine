@@ -261,13 +261,22 @@ static inline BOOL use_aslr(void)
            (main_image_info.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE);
 }
 
+/* Anonymous writable+executable memory is mapped MAP_JIT (needs the
+ * com.apple.security.cs.allow-jit entitlement, which this build ships with):
+ * plain pages cannot hold W+X on Apple Silicon, and mapping them RX instead
+ * costs virtual_handle_fault() a write fault and an execute fault per flip,
+ * which a JIT's write-then-run cycle turns into hundreds of thousands of
+ * faults per second. On MAP_JIT pages W+X protections are grantable, and
+ * mprotect_exec() takes them without flipping. */
+#define ANON_MMAP_JIT(prot) (((prot) & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC) ? MAP_JIT : 0)
+
 /* mmap() anonymous memory at a fixed address */
 void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
 {
     assert( !((UINT_PTR)start & host_page_mask) );
     assert( !(size & host_page_mask) );
 
-    return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, -1, 0 );
+    return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags | ANON_MMAP_JIT(prot), -1, 0 );
 }
 
 /* allocate anonymous mmap() memory at any address */
@@ -275,7 +284,7 @@ void *anon_mmap_alloc( size_t size, int prot )
 {
     assert( !(size & host_page_mask) );
 
-    return mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON, -1, 0 );
+    return mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON | ANON_MMAP_JIT(prot), -1, 0 );
 }
 
 static inline UINT_PTR make_mem_area( void *base, enum area_state state )
@@ -940,6 +949,90 @@ static inline BOOL is_host_page_write_mixed( const void *addr ) { return FALSE; 
 #endif
 
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/***********************************************************************
+ * remapped MAP_JIT host pages
+ *
+ * Once a host page has been remapped MAP_JIT, macOS refuses any mprotect()
+ * on it at all: its W<->X state is governed solely by the per-thread JIT
+ * write toggle (APRR), so writes need the toggle off and execution needs it
+ * on. The fault handler consults this table to know a page is already
+ * MAP_JIT and a toggle is all it takes.
+ */
+#define MAX_REMAPPED_JIT_PAGES 8192
+static void *remapped_jit_pages[MAX_REMAPPED_JIT_PAGES];
+static volatile int remapped_jit_page_count;
+
+static BOOL is_remapped_jit_page( const void *page )
+{
+    int i, n = remapped_jit_page_count;
+    for (i = 0; i < n; i++)
+        if (remapped_jit_pages[i] == page) return TRUE;
+    return FALSE;
+}
+
+/* Invalidate registry entries for a freed range (see delete_view). */
+static void unregister_remapped_jit_pages( void *base, size_t size )
+{
+    char *start = ROUND_ADDR( base, host_page_mask );
+    char *end = (char *)base + size;
+    char *page;
+    int i, n = remapped_jit_page_count;
+    for (page = start; page < end; page += host_page_size)
+        for (i = 0; i < n; i++)
+            if (remapped_jit_pages[i] == page) remapped_jit_pages[i] = NULL;
+}
+
+static void register_remapped_jit_page( void *base, size_t size )
+{
+    char *page;
+    for (page = ROUND_ADDR( base, host_page_mask ); page < (char *)base + size; page += host_page_size)
+    {
+        int idx;
+        if (is_remapped_jit_page( page )) continue;
+        idx = remapped_jit_page_count;
+        if (idx >= MAX_REMAPPED_JIT_PAGES) return;
+        remapped_jit_pages[idx] = page;
+        remapped_jit_page_count = idx + 1;
+    }
+}
+
+/* Drop MAP_JIT semantics: macOS refuses every mprotect on a MAP_JIT page,
+ * so a program's VirtualProtect on a page we remapped (a packer flipping
+ * its unpacking buffer RW/RX) would fail forever. Remap the host pages to
+ * a plain mapping with the requested protections, contents preserved.
+ * Never remap uncommitted pages: the copy would fault, and a fault inside
+ * mprotect_range deadlocks on virtual_mutex (observed: NtAllocateVirtualMemory
+ * wedged in set_protection when a freed JIT page was re-allocated while its
+ * address stayed in the registry). */
+static BOOL unmap_jit_pages( void *base, size_t size, int unix_prot )
+{
+    char *start = ROUND_ADDR( base, host_page_mask );
+    char *end = (char *)base + size;
+    BOOL ok = TRUE;
+    char *page;
+
+    for (page = start; page < end; page += host_page_size)
+    {
+        void *tmp;
+        int i, n = remapped_jit_page_count;
+        if (!is_remapped_jit_page( page )) continue; /* registered = mapped */
+        tmp = mmap( NULL, host_page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0 );
+        if (tmp == MAP_FAILED) { ok = FALSE; continue; }
+        memcpy( tmp, page, host_page_size );
+        if (mmap( page, host_page_size, unix_prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0 ) != page)
+            ok = FALSE;
+        else
+            memcpy( page, tmp, host_page_size );
+        munmap( tmp, host_page_size );
+        for (i = 0; i < n; i++)
+            if (remapped_jit_pages[i] == page) remapped_jit_pages[i] = NULL;
+    }
+    return ok;
+}
+#endif
+
+
 /***********************************************************************
  *           get_vprot_range_size
  *
@@ -1584,6 +1677,12 @@ static void delete_view( struct file_view *view ) /* [in] View */
 {
     if (!(view->protect & VPROT_SYSTEM)) unmap_area( view->base, view->size );
     set_page_vprot( view->base, view->size, 0 );
+    /* JIT-remap registry entries are void once the mapping is gone: a stale
+     * entry makes a later allocation at this address remap unmapped memory
+     * in mprotect_exec, whose copy faults into virtual_handle_fault while
+     * virtual_mutex is held - a self-deadlock (winedevice wedged in
+     * NtAllocateVirtualMemory). */
+    unregister_remapped_jit_pages( view->base, view->size );
     if (view->protect & VPROT_ARM64EC) clear_arm64ec_range( view->base, view->size );
     unregister_view( view );
     free_view( view );
@@ -1716,13 +1815,47 @@ static NTSTATUS get_vprot_flags( DWORD protect, unsigned int *vprot, BOOL image 
  *
  * Wrapper for mprotect, adds PROT_EXEC if forced by force_exec_prot
  */
+#if defined(__APPLE__) && defined(__aarch64__)
+extern void pthread_jit_write_protect_np( int enabled );
+#endif
+
 static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 {
 #if defined(__APPLE__) && defined(__aarch64__)
-    /* W+X is never granted without MAP_JIT; start executable, virtual_handle_fault() flips
-     * the host page between RX and RW as needed. */
-    if ((unix_prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC)) unix_prot &= ~PROT_WRITE;
+    /* W+X is not granted without MAP_JIT or the disable-executable-page-protection
+     * entitlement; when it is, take it: the RX/RW flips of virtual_handle_fault cost
+     * a fault per write and per execution, which a JIT's or a packed program's
+     * write-then-run cycle turns into hundreds of thousands per second. */
+    if ((unix_prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC))
+    {
+        if (is_remapped_jit_page( ROUND_ADDR( base, host_page_mask ) ))
+        {
+            /* already MAP_JIT: mprotect is refused on it, the toggle governs */
+            pthread_jit_write_protect_np( false );
+            return 0;
+        }
+        if (!mprotect( base, size, unix_prot )) return 0;
+        /* ENOMEM (not yet mapped) or EPERM (W+X refused): strip write and
+         * let the plain mprotect below apply what it can; the first store
+         * to such a page faults once and the fault handler remaps it MAP_JIT
+         * - never speculatively copy here, a partially-mapped range
+         * deadlocks (mprotect reports EPERM before it reaches the
+         * unmapped tail pages). */
 #endif
+        unix_prot &= ~PROT_WRITE;
+    }
+    else if ((ULONG_PTR)base < 0x0000700000000000UL &&
+             is_remapped_jit_page( ROUND_ADDR( base, host_page_mask ) ))
+    {
+        /* Any other protection change on a MAP_JIT page (a packer flipping
+         * its buffer RW to write, RX to run) is refused by macOS wholesale:
+         * leave JIT semantics by remapping the host pages plain. Guest
+         * memory only: the emulator's JIT arena also lives in remapped
+         * pages high in the address space, and remapping those plain
+         * breaks its code generation (kernel32 c0000135 under load). */
+        if (unmap_jit_pages( base, size, unix_prot ))
+            return 0;
+    }
     if (force_exec_prot && (unix_prot & PROT_READ) && !(unix_prot & PROT_EXEC))
     {
         TRACE( "forcing exec permission on %p-%p\n", base, (char *)base + size - 1 );
@@ -2031,6 +2164,16 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         unix_prot = get_unix_prot( vprot & ~VPROT_WRITEWATCH );
 
     unix_prot &= ~PROT_EXEC;
+#ifdef MAP_JIT
+    /* W+X pages are only ever satisfiable as MAP_JIT mappings on Apple
+     * Silicon: map them so at birth, before any bookkeeping strips or
+     * re-adds protections later. */
+    if ((vprot & VPROT_EXEC) && (vprot & VPROT_WRITE))
+    {
+        unix_prot |= PROT_EXEC;
+        goto map_jit;
+    }
+#endif
 
     if (base)
     {
@@ -2064,6 +2207,26 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         }
         else
         {
+map_jit:
+#ifdef MAP_JIT
+            /* MAP_JIT mapping: RWX granted at mmap (per-thread write toggle governs). */
+            if ((vprot & VPROT_EXEC) && (vprot & VPROT_WRITE))
+            {
+                int jit_prot = unix_prot | PROT_WRITE | PROT_EXEC;
+                ptr = mmap( NULL, view_size, jit_prot, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0 );
+                if (ptr != MAP_FAILED)
+                {
+                    ptr = unmap_extra_space( ptr, view_size, host_size, align_mask );
+                    TRACE( "mapped MAP_JIT RWX %p-%p\n", ptr, (char *)ptr + size );
+                    status = create_view( view_ret, ptr, size, vprot );
+                    if (status != STATUS_SUCCESS) unmap_area( ptr, size );
+                    return status;
+                }
+                WARN( "MAP_JIT mmap failed errno %d\n", errno );
+                /* fall through to the regular path */
+                unix_prot &= ~(PROT_WRITE | PROT_EXEC);
+            }
+#endif
             if ((ptr = anon_mmap_alloc( view_size, unix_prot )) == MAP_FAILED)
             {
                 status = (errno == ENOMEM) ? STATUS_NO_MEMORY : STATUS_INVALID_PARAMETER;
@@ -4496,6 +4659,27 @@ static NTSTATUS grow_thread_stack( struct thread_data *data, char *page, struct 
 }
 
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/***********************************************************************
+ *           is_ro_stack_page
+ *
+ * Whether a faulting address sits in a committed write-protected page
+ * inside its own wow64 stack - a packer stub VirtualProtect'ed the page
+ * holding its on-stack code (read-only is enough under FEX: guest code is
+ * fetched as data) and then pushes into its locals above it, a full SEH
+ * round trip per store.
+ */
+static BOOL is_ro_stack_page( struct thread_data *data, void *addr, char *host_page )
+{
+    BYTE pvprot = get_page_vprot( ROUND_ADDR( addr, page_mask ) );
+    struct thread_stack_info stack_info;
+    return (pvprot & VPROT_COMMITTED) &&
+           !(pvprot & (VPROT_WRITE | VPROT_WRITECOPY | VPROT_GUARD)) &&
+           is_inside_thread_stack( data, host_page, &stack_info );
+}
+#endif
+
+
 /***********************************************************************
  *           virtual_handle_fault
  */
@@ -4519,6 +4703,62 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
     }
 #endif
 
+    /* Win9x-era programs park the main thread's stack at the very top of the
+     * 4G space (the 9x loader's convention) and set Esp there without ever
+     * allocating it (AquaMark3's startup is one). Map the pages on demand,
+     * like a stack grow: the 32-bit process cannot see above its wow limit,
+     * so nothing else lives there. Only when the guest's Esp is actually
+     * parked up there - a running thread storing into the top region as
+     * data (SEH structures, Win9x-isms) must NOT rebase the TEB stack:
+     * NtRaiseException then rejects every frame in the real stack. */
+    if (err == EXCEPTION_WRITE_FAULT && (ULONG_PTR)addr >= 0xffff0000UL &&
+        (ULONG_PTR)addr < 0x100000000UL && !vprot && is_wow64())
+    {
+        unsigned int *i386 = get_cpu_area( data, IMAGE_FILE_MACHINE_I386 );
+        unsigned int esp = i386 ? i386[0xC4/4] : 0;
+        if (!map_fixed_area( (void *)0xfff00000UL, 0x100000, PROT_READ | PROT_WRITE ))
+        {
+            WOW_TEB *wow_teb = get_wow_teb( data->teb );
+            set_page_vprot( (void *)0xfff00000UL, 0x100000, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED );
+            /* The TEB must describe the stack it now runs on, or NtRaiseException
+             * refuses to dispatch its frames ("not in stack limits"). Only when
+             * Esp is parked up there; a data write from a thread running on the
+             * real stack must not move it. */
+            /* Require a sane parked context: Esp up there AND the guest Eip in
+             * app code. A zeroed/wrapped Esp (exception-path corruption)
+             * must not rebase a low-stack thread's TEB. */
+            if (esp >= 0xffff0000UL && i386 && (i386[0xB8/4] & 0x80000000) == 0 &&
+                wow_teb && wow_teb->DeallocationStack < 0xffff0000UL)
+            {
+                wow_teb->DeallocationStack = 0xfff00000UL;
+                wow_teb->Tib.StackLimit = 0xfffff000UL;
+                wow_teb->Tib.StackBase = 0xfffffff8UL;
+                ERR( "wow64: program stack moved to the top of the 4G space (was %lx-%lx)\n",
+                     (unsigned long)wow_teb->Tib.StackLimit, (unsigned long)wow_teb->Tib.StackBase );
+            }
+            TRACE( "wow64 top-of-4G stack page %p mapped on demand\n", page );
+            mutex_unlock( &virtual_mutex );
+            rec->ExceptionCode = STATUS_SUCCESS;
+            return STATUS_SUCCESS;
+        }
+    }
+
+    /* The emulator's arena: reserved-but-writable pages the emulator
+     * touches during module loading, expecting commit-on-demand (its
+     * OvercommitTracker only covers ranges it was told about). A read of
+     * such a page is an unhandled fault that kills the loader (fixtures
+     * die with no output, c00000bb-class). Commit the page on demand. */
+    if (err == EXCEPTION_READ_FAULT && (ULONG_PTR)addr >= 0x0000700000000000UL &&
+        (ULONG_PTR)addr < 0x0000800000000000UL &&
+        (vprot & VPROT_READ) && (vprot & VPROT_WRITE) && !(vprot & VPROT_COMMITTED))
+    {
+        set_page_vprot_bits( page, host_page_size, VPROT_COMMITTED, 0 );
+        mprotect_range( page, host_page_size, 0, 0 );
+        mutex_unlock( &virtual_mutex );
+        rec->ExceptionCode = STATUS_SUCCESS;
+        return STATUS_SUCCESS;
+    }
+
     if (!is_inside_signal_stack( data, stack ) && (vprot & VPROT_GUARD))
     {
         struct thread_stack_info stack_info;
@@ -4532,6 +4772,15 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
     }
     else if (err == EXCEPTION_WRITE_FAULT)
     {
+#if defined(__APPLE__) && defined(__aarch64__)
+        /* A MAP_JIT page's write protection is per-thread: a page that is
+         * already W+X for the process still faults for a thread that has
+         * JIT write protection on, and mprotect cannot clear it. Disable it
+         * for this thread; an emulator's code generation hits this on every
+         * first write per thread. */
+        if (is_vprot_exec_write( vprot ) && (get_unix_prot( vprot ) & PROT_WRITE))
+            pthread_jit_write_protect_np( false );
+#endif
         if (vprot & VPROT_WRITEWATCH)
         {
             if (enable_write_exceptions && is_vprot_exec_write( vprot ) && !data->allow_writes)
@@ -4550,11 +4799,93 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
         /* W^X: a W+X page is mapped RX (see mprotect_exec), make it RW for the write */
         if (is_vprot_exec_write( get_host_page_vprot( page ) ) &&
             (get_unix_prot( get_host_page_vprot( page ) ) & PROT_WRITE) &&
-            !is_host_page_write_mixed( page ) &&
-            !mprotect( page, host_page_size, PROT_READ | PROT_WRITE ))
+            !is_host_page_write_mixed( page ))
         {
-            TRACE_(wx)( "%p: RX -> RW for write to %p\n", page, addr );
+            /* Already MAP_JIT (remapped by mprotect_exec or below): macOS
+             * refuses any mprotect on such pages, so the per-thread JIT
+             * write toggle set above is all the store needs. Just retry. */
+            if (is_remapped_jit_page( page ))
+            {
+                pthread_jit_write_protect_np( false );
+                ret = STATUS_SUCCESS;
+            }
+            else if (!mprotect( page, host_page_size, PROT_READ | PROT_WRITE | PROT_EXEC ))
+                ret = STATUS_SUCCESS;  /* W+X still grantable for this page */
+            else
+            {
+                /* W+X refused: remap the host page MAP_JIT, copy-preserving,
+                 * the same sequence mprotect_exec uses; the store proceeds
+                 * with the toggle off. */
+                struct file_view *view = find_view( page, host_page_size );
+                if (view && !(view->protect & VPROT_SYSTEM))
+                {
+                    void *tmp = mmap( NULL, host_page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0 );
+                    if (tmp != MAP_FAILED)
+                    {
+                        memcpy( tmp, page, host_page_size );
+                        if (mmap( page, host_page_size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                  MAP_PRIVATE | MAP_ANON | MAP_FIXED | MAP_JIT, -1, 0 ) == page)
+                        {
+                            memcpy( page, tmp, host_page_size );
+                            sys_icache_invalidate( page, host_page_size );
+                            register_remapped_jit_page( page, host_page_size );
+                            pthread_jit_write_protect_np( false );
+                            ret = STATUS_SUCCESS;
+                        }
+                        munmap( tmp, host_page_size );
+                    }
+                }
+            }
+            if (ret == STATUS_SUCCESS)
+                TRACE_(wx)( "%p: write enabled for %p\n", page, addr );
+        }
+        /* A packer stub running on the guest's own stack: it write-protects
+         * the page holding its on-stack code and still stores into its
+         * locals above it - each store a full SEH round trip, a million
+         * faults a minute. Grant the store physically - plain RW, no exec
+         * needed (the emulator fetches guest code as data) - and leave
+         * vprot alone so VirtualQuery keeps reporting what the app set. */
+        else if (is_wow64() && is_ro_stack_page( data, addr, page ))
+        {
+            if (!mprotect( page, host_page_size, PROT_READ | PROT_WRITE ))
+                ret = STATUS_SUCCESS;
+            else if (is_remapped_jit_page( page ))
+            {
+                pthread_jit_write_protect_np( false );
+                ret = STATUS_SUCCESS;
+            }
+            else
+            {
+                struct file_view *view = find_view( page, host_page_size );
+                if (view && !(view->protect & VPROT_SYSTEM))
+                {
+                    void *tmp = mmap( NULL, host_page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0 );
+                    if (tmp != MAP_FAILED)
+                    {
+                        memcpy( tmp, page, host_page_size );
+                        if (mmap( page, host_page_size, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0 ) == page)
+                        {
+                            memcpy( page, tmp, host_page_size );
+                            ret = STATUS_SUCCESS;
+                        }
+                        munmap( tmp, host_page_size );
+                    }
+                }
+            }
+        }
+        /* chain continues for MAP_JIT-presumed / flip-refused cases */
+        else if (is_vprot_exec_write( get_host_page_vprot( page ) ) && !is_host_page_write_mixed( page ))
+        {
+            TRACE_(wx)( "%p: MAP_JIT presumed, write enabled by toggle for %p\n", page, addr );
             ret = STATUS_SUCCESS;
+        }
+        else if (is_vprot_exec_write( get_host_page_vprot( page ) ))
+        {
+            int e = errno;
+            ERR( "jitwr: page %p: flip refused (mixed %d errno %d prot-now %x)\n", page,
+                 is_host_page_write_mixed( page ), e,
+                 get_unix_prot( get_host_page_vprot( page ) ) );
         }
         else
 #endif
@@ -4567,13 +4898,27 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec, 
     }
 #if defined(__APPLE__) && defined(__aarch64__)
     else if (err == EXCEPTION_EXECUTE_FAULT && is_vprot_exec_write( vprot ) &&
-             (get_unix_prot( vprot ) & PROT_EXEC) &&
-             !mprotect( page, host_page_size, PROT_READ | PROT_EXEC ))
+             (get_unix_prot( vprot ) & PROT_EXEC))
     {
-        /* W^X: page was RW, make it RX again */
-        TRACE_(wx)( "%p: RW -> RX for execution\n", page );
-        sys_icache_invalidate( page, host_page_size );
-        ret = STATUS_SUCCESS;
+        /* W^X: page was RW, make it RX again. A non-MAP_JIT page takes the
+         * mprotect; a MAP_JIT page cannot be mprotect'ed at all on macOS -
+         * its W<->X state is the per-thread JIT write toggle (APRR). */
+        if (!mprotect( page, host_page_size, PROT_READ | PROT_EXEC ))
+        {
+            sys_icache_invalidate( page, host_page_size );
+            ret = STATUS_SUCCESS;
+        }
+        else
+        {
+            /* A MAP_JIT page: mprotect is refused on it wholesale, and on
+             * Apple Silicon the JIT write toggle is a per-thread APRR swap -
+             * with writes enabled execution is masked. Write-protect this
+             * thread: execution returns, and the next store faults into the
+             * write branch above, which toggles writes back on. */
+            pthread_jit_write_protect_np( true );
+            sys_icache_invalidate( page, host_page_size );
+            ret = STATUS_SUCCESS;
+        }
     }
 #endif
     mutex_unlock( &virtual_mutex );
@@ -4682,11 +5027,21 @@ void *virtual_setup_exception( struct thread_data *data, void *stack_ptr, size_t
 
     if (stack < stack_info.start + host_page_size)
     {
-        /* stack overflow on last page, unrecoverable */
-        UINT diff = stack_info.start + host_page_size - stack;
-        ERR( "stack overflow %u bytes addr %p stack %p (%p-%p-%p)\n",
-             diff, rec->ExceptionAddress, stack, stack_info.start, stack_info.limit, stack_info.end );
-        abort_thread(1);
+        if (stack < stack_info.start)
+        {
+            /* below the whole stack: unrecoverable */
+            UINT diff = stack_info.start - stack;
+            ERR( "stack overflow %u bytes addr %p stack %p (%p-%p-%p)\n",
+                 diff, rec->ExceptionAddress, stack, stack_info.start, stack_info.limit, stack_info.end );
+            abort_thread(1);
+        }
+        /* The frame still fits in the stack's first mapped page. Windows
+         * delivers a stack-overflow exception here, which the application's
+         * SEH can unwind and recover from; WoW64's translated code faults
+         * with its stack pointer that low (the emulator's frames share the
+         * guest stack), so aborting kills programs that Windows runs. */
+        rec->ExceptionCode = STATUS_STACK_OVERFLOW;
+        rec->NumberParameters = 0;
     }
     else if (stack < stack_info.limit)
     {
@@ -6979,7 +7334,12 @@ NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T
             {
                 BYTE vprot = get_host_page_vprot( page );
                 if (is_vprot_exec_write( vprot ) && (get_unix_prot( vprot ) & PROT_EXEC))
-                    mprotect( page, host_page_size, PROT_READ | PROT_EXEC );
+                {
+                    /* MAP_JIT pages refuse mprotect entirely; the per-thread
+                     * toggle governs their writes, so leave them RWX. */
+                    if (mprotect( page, host_page_size, PROT_READ | PROT_EXEC ))
+                        pthread_jit_write_protect_np( true );
+                }
             }
             server_leave_uninterrupted_section( &virtual_mutex, &sigset );
         }
