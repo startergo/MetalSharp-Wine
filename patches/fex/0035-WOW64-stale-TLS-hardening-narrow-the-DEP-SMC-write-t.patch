@@ -1,22 +1,41 @@
+From a033d213c26b89aa0d6e15a254d1f40674f62584 Mon Sep 17 00:00:00 2001
+From: startergo <7897244+startergo@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 00:52:53 -0500
+Subject: [PATCH 35/36] WOW64: stale-TLS hardening; narrow the DEP SMC
+ write-trap; null-buffer guards
+
+BTCpuResetToConsistentState validates the ThreadState TLS pointer
+(NtQueryVirtualMemory) before use: the slot can hold a stale pointer
+once the thread has left simulation, and a fault while handling a fault
+then unwinds into the nested-exception loop. The profiling increments
+and the ReconstructWowContext / EntryContext outputs are guarded the
+same way, raising through the validated EntryCtx.
+
+InvalidationTracker write-traps only explicitly executable pages: with
+DEP disabled every readable protect counted as effective-exec, so a
+packer's per-byte unprotect inserted the page as an SMC interval, the
+recompiled stub re-trapped it read-only and the retried store faulted
+again - an unbreakable loop. DEP-promoted pages stay execute-tracked.
+
+CPUFeatures bounds the registry CPU sweep by dwNumberOfProcessors and
+closes the final key (wine's registry answers every index, so the sweep
+never terminated). JIT and SharedCodeBufferManager terminate loudly on
+a null code buffer instead of letting the emitter write to address 0.
+Module gains a WLOG2 helper writing straight to ntdll's debug channel
+(CRT file IO deadlocks in exception context).
+---
+ FEXCore/Source/Interface/Core/JIT/JIT.cpp     |  5 +++
+ .../Core/SharedCodeBufferManager.cpp          |  6 ++-
+ Source/Windows/Common/CPUFeatures.cpp         |  8 +++-
+ Source/Windows/Common/InvalidationTracker.cpp |  9 +++-
+ Source/Windows/WOW64/Module.cpp               | 44 ++++++++++++++++---
+ 5 files changed, 62 insertions(+), 10 deletions(-)
+
 diff --git a/FEXCore/Source/Interface/Core/JIT/JIT.cpp b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
-index 799e0d6..3e8bd8c 100644
+index 799e0d6ea..45b81f6dc 100644
 --- a/FEXCore/Source/Interface/Core/JIT/JIT.cpp
 +++ b/FEXCore/Source/Interface/Core/JIT/JIT.cpp
-@@ -955,8 +955,13 @@ CodeBuffer::CodeBufferAllocation Arm64JITCore::AllocateCodeBufferInSharedCache(s
-   return AllocatedInfo;
- }
- 
-+/* Set by the frontend (BTCpuProcessInit) to receive every compiled guest block. */
-+extern "C" void (*FEXGuestBlockCallback)(uint64_t);
-+void (*FEXGuestBlockCallback)(uint64_t);
-+
- CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size, bool SingleInst, const FEXCore::IR::IRListView* IR,
-                                                    FEXCore::Core::DebugData* DebugData, bool CheckTF) {
-+  if (FEXGuestBlockCallback) FEXGuestBlockCallback(Entry);
-   FEXCORE_PROFILE_SCOPED("Arm64::CompileCode");
- 
-   const auto PrevNumAllocations = Relocations.size();
-@@ -998,6 +1003,11 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
+@@ -998,6 +998,11 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
    // JIT output is first written to a temporary buffer and later relocated to the CodeBuffer.
    // This minimizes lock contention of CodeBufferWriteMutex.
    auto TempCodeBufferInfo = TempCodeBufferAllocator.ReownOrClaimBufferWithSize(DesiredBufferRange);
@@ -29,7 +48,7 @@ index 799e0d6..3e8bd8c 100644
    const uint32_t UsableBufferRange = TempCodeBufferInfo.Size - FEXCore::Utils::FEX_PAGE_SIZE;
  
 diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
-index eee5023..655b563 100644
+index eee502364..655b56312 100644
 --- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
 +++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
 @@ -19,7 +19,11 @@ static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
@@ -46,7 +65,7 @@ index eee5023..655b563 100644
    // Protect the last page of the allocated buffer to trigger SIGSEGV on write access
    uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
 diff --git a/Source/Windows/Common/CPUFeatures.cpp b/Source/Windows/Common/CPUFeatures.cpp
-index 1a0001c..5e587dc 100644
+index 1a0001c6b..5e587dc4e 100644
 --- a/Source/Windows/Common/CPUFeatures.cpp
 +++ b/Source/Windows/Common/CPUFeatures.cpp
 @@ -69,11 +69,17 @@ FEXCore::HostFeatures CPUFeatures::FetchHostFeatures(bool IsWine, FEXCore::HostF
@@ -69,7 +88,7 @@ index 1a0001c..5e587dc 100644
    FEX::FetchHostFeatures(Features, HostFeatures, !IsWine, CTR, MIDR);
  
 diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
-index e5e0cd8..853796e 100644
+index e5e0cd889..853796ebb 100644
 --- a/Source/Windows/Common/InvalidationTracker.cpp
 +++ b/Source/Windows/Common/InvalidationTracker.cpp
 @@ -56,7 +56,14 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
@@ -88,24 +107,8 @@ index e5e0cd8..853796e 100644
  
      if (EffectiveExec) {
        XIntervals.Insert(ProtInterval);
-diff --git a/Source/Windows/Common/WinAPI/Alloc.cpp b/Source/Windows/Common/WinAPI/Alloc.cpp
-index ded646b..96f696d 100644
---- a/Source/Windows/Common/WinAPI/Alloc.cpp
-+++ b/Source/Windows/Common/WinAPI/Alloc.cpp
-@@ -49,6 +49,11 @@ DLLEXPORT_FUNC(void*, VirtualAlloc, (void* lpAddress, SIZE_T dwSize, DWORD flAll
-   }
- #endif
-   if (Status) {
-+    /* Wine's allocation failure status: the JIT's temp-buffer null crashes
-+     * far away; log it at the source. */
-+    if (Status & 0xC0000000) {
-+      DbgPrint("FEXVA: NtAllocateVirtualMemory size=%lu failed status %lx\n", (unsigned long)dwSize, Status);
-+    }
-     SetLastError(RtlNtStatusToDosError(Status));
-     return nullptr;
-   }
 diff --git a/Source/Windows/WOW64/Module.cpp b/Source/Windows/WOW64/Module.cpp
-index a45a87b..14631af 100644
+index a45a87b2d..f972c734b 100644
 --- a/Source/Windows/WOW64/Module.cpp
 +++ b/Source/Windows/WOW64/Module.cpp
 @@ -134,6 +134,15 @@ namespace BridgeInstrs {
@@ -124,54 +127,7 @@ index a45a87b..14631af 100644
  fextl::unique_ptr<FEX::DummyHandlers::DummySignalDelegator> SignalDelegator;
  fextl::unique_ptr<WowSyscallHandler> SyscallHandler;
  fextl::unique_ptr<FEX::Windows::StatAlloc> StatAllocHandler;
-@@ -444,6 +453,15 @@ public:
- 
-       Context::FlushThreadStateContext();
-       Context::UnlockJITContext();
-+      { /* Guest-RIP sampler: which guest code makes the unix calls. */
-+        static volatile unsigned Samples;
-+        if ((++Samples & 0x3FF) == 0) {
-+          char B[128];
-+          snprintf(B, sizeof(B), "FEXUCALL rip %llx id %x\n",
-+                   (unsigned long long)ReturnRIP, (unsigned)StackArgs->ID);
-+          WLOG2(B);
-+        }
-+      }
-       ReturnRAX = static_cast<uint64_t>(WineUnixCall(StackArgs->Handle, StackArgs->ID, ULongToPtr(StackArgs->Args)));
-       Context::LockJITContext();
-       Frame->State.gregs[FEXCore::X86State::REG_RAX] = ReturnRAX;
-@@ -500,7 +518,30 @@ public:
-   }
- };
- 
-+/* Guest-RIP block-compile sampler: FEXCore calls this for every JIT-compiled
-+ * guest block (weak hook). A stable loop stops producing new blocks; the ring
-+ * buffer's tail at that point is the loop body's guest addresses. */
-+static void GuestBlockLogger(uint64_t GuestEntry) {
-+  static uint64_t Ring[64];
-+  static unsigned RingIdx, Total;
-+  Ring[RingIdx++ & 63] = GuestEntry;
-+  if ((++Total & 16383) == 1) {  /* first block, then every 16384th: the tail at
-+                                    that point still names a stable loop body */
-+    char B[1024];
-+    int Off = snprintf(B, sizeof(B), "FEXBLOCKS n=%u tail:", Total);
-+    for (unsigned i = 0; i < 16 && Off > 0 && (size_t)Off < sizeof(B) - 12; i++)
-+      Off += snprintf(B + Off, sizeof(B) - Off, " %llx",
-+                      (unsigned long long)Ring[(RingIdx - 16 + i) & 63]);
-+    snprintf(B + Off, sizeof(B) - Off, "\n");
-+    WLOG2(B);
-+  }
-+}
-+
-+extern "C" void (*FEXGuestBlockCallback)(uint64_t);
-+
- void BTCpuProcessInit() {
-+  FEXGuestBlockCallback = &GuestBlockLogger;
-+  { char B[96]; snprintf(B, sizeof(B), "FEXBASE %p\n", (void*)&BTCpuProcessInit); WLOG2(B); }
-   FEX::Windows::InitCRTProcess();
-   FEX::Windows::SetupThreadHandlers();
-   const auto ExecutablePath = FEX::Windows::GetExecutableFilePath();
-@@ -559,7 +600,11 @@ void BTCpuProcessInit() {
+@@ -559,7 +568,11 @@ void BTCpuProcessInit() {
  
    CPUFeatures.emplace(*CTX);
  
@@ -184,24 +140,7 @@ index a45a87b..14631af 100644
    SIZE_T Size = 4;
    void* Addr = nullptr;
    NtAllocateVirtualMemory(NtCurrentProcess(), &Addr, (1U << 31) - 1, &Size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-@@ -731,6 +776,16 @@ __attribute__((naked)) void BTCpuSimulate() {
- }
- 
- extern "C" void BTCpuSimulateImpl(CONTEXT* entry_context) {
-+  { /* Guest-RIP sampler: BTCpuSimulate runs once per dispatch iteration. */
-+    static volatile unsigned Samples;
-+    if ((++Samples & 0x7) == 0) {  // every 65536th
-+      auto T = GetTLS().ThreadState();
-+      char B[96];
-+      snprintf(B, sizeof(B), "FEXSIM rip %llx\n",
-+               T && T->CurrentFrame ? (unsigned long long)T->CurrentFrame->State.rip : 0ull);
-+      WLOG2(B);
-+    }
-+  }
-   const auto TLS = GetTLS();
-   TLS.EntryContext() = entry_context;
-   TLS.CachedCallRetSp() = TLS.ThreadState()->CurrentFrame->State.callret_sp;
-@@ -749,12 +804,21 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+@@ -749,12 +762,21 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
    auto* Context = Ptrs->ContextRecord;
    auto* Exception = Ptrs->ExceptionRecord;
    auto Thread = GetTLS().ThreadState();
@@ -225,7 +164,7 @@ index a45a87b..14631af 100644
        return true;
      }
  
-@@ -762,14 +826,14 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+@@ -762,14 +784,14 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
        return true;
      }
  
@@ -242,24 +181,16 @@ index a45a87b..14631af 100644
        if (InvalidationTracker->HandleRWXAccessViolation(Thread, Context->Pc, FaultAddress)) {
          if (CTX->IsAddressInCodeBuffer(Thread, Context->Pc) && !CTX->IsCurrentBlockSingleInst(Thread) &&
              CTX->IsAddressInCurrentBlock(Thread, FaultAddress & FEXCore::Utils::FEX_PAGE_MASK, FEXCore::Utils::FEX_PAGE_SIZE)) {
-@@ -798,7 +862,15 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+@@ -798,7 +820,7 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
      return true;
    }
  
 -  FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSIGBUSCount, 1);
 +  if (Thread) FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedSIGBUSCount, 1);
-+  if (Exception->ExceptionCode == EXCEPTION_DATATYPE_MISALIGNMENT) {
-+    { static volatile unsigned M; if ((++M & 0x3F) == 1) {
-+        const uint64_t Rip = Thread ? Thread->CurrentFrame->State.rip : 0;
-+        char B[96];
-+        snprintf(B, sizeof(B), "FEXMISALIGN gripeip %llx ppc %llx\n",
-+                 (unsigned long long)Rip, (unsigned long long)Context->Pc);
-+        WLOG2(B); } }
-+  }
    if (Exception->ExceptionCode == EXCEPTION_DATATYPE_MISALIGNMENT && Context::HandleUnalignedAccess(Context)) {
      LogMan::Msg::DFmt("Handled unaligned atomic: new pc: {:X}", Context->Pc);
      return true;
-@@ -807,6 +879,14 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+@@ -807,6 +829,14 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
    LogMan::Msg::DFmt("Reconstructing context");
  
    WOW64_CONTEXT* WowContext = Context::ReconstructWowContext(Context);
@@ -274,18 +205,15 @@ index a45a87b..14631af 100644
    LogMan::Msg::DFmt("pc: {:X} eip: {:X} code: {:X}", Context->Pc, WowContext->Eip, Exception->ExceptionCode);
  
    auto& Fault = Thread->CurrentFrame->SynchronousFaultData;
-@@ -824,7 +904,13 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
+@@ -824,7 +854,7 @@ bool BTCpuResetToConsistentStateImpl(EXCEPTION_POINTERS* Ptrs) {
    // wow64.dll will handle adjusting PC in the dispatched context after a breakpoint
  
    Context::UnlockJITContext();
 -  NtRaiseException(&GuestException, GetTLS().EntryContext(), FirstChance);
-+  { static volatile unsigned N; if ((++N & 0xF) == 1) {
-+      char B[200];
-+      snprintf(B, sizeof(B), "FEXRAISE eip %08x esp %08x ppc %llx gripeip %llx\n",
-+               WowContext->Eip, WowContext->Esp, (unsigned long long)Context->Pc,
-+               (unsigned long long)(Thread ? Thread->CurrentFrame->State.rip : 0));
-+      WLOG2(B); } }
 +  NtRaiseException(&GuestException, EntryCtx, FirstChance);
    return false;
  }
  
+-- 
+2.54.0
+
